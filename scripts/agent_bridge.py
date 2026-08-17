@@ -531,10 +531,28 @@ def goal_from_meta(meta: dict[str, str]) -> str | None:
 # --- readiness ----------------------------------------------------------------
 
 
+def capture_pane_text(target: str, *, history: bool = False,
+                      check: bool = True) -> subprocess.CompletedProcess[str]:
+    """Capture a pane as logical lines, not screen rows.
+
+    -J is not cosmetic. Without it capture-pane emits one line per terminal row,
+    so a frame long enough to wrap is cut at the column boundary — and the cut
+    lands inside `<<<END_AGENT_MSG>>>` often enough to matter. submitted() then
+    fails to find the delimiter and reports the frame as sent while it is still
+    sitting in the target's input box: a false success in the one check whose
+    entire job is to catch a false success. Reproduced in a 40-column pane, where
+    the capture reads "<<<END_AG" / "ENT_MSG>>>" on consecutive rows.
+    """
+    args = ["capture-pane", "-p", "-J", "-t", target]
+    if history:
+        args.extend(["-S", "-80"])
+    return run_tmux(args, check=check)
+
+
 def capture_target(target: str) -> str:
     if not PANE_RE.fullmatch(target):
         raise BridgeError(f"invalid target pane id: {target!r}")
-    return run_tmux(["capture-pane", "-p", "-t", target, "-S", "-80"]).stdout
+    return capture_pane_text(target, history=True).stdout
 
 
 def looks_ready(capture: str) -> bool:
@@ -604,9 +622,19 @@ class Focus:
     def __enter__(self) -> Focus:
         if FOCUS_MODE == "off":
             return self
-        active = run_tmux(["display-message", "-p", "-t", self.target, "#{pane_active}"],
-                          check=False)
-        if active.returncode == 0 and active.stdout.strip() == "1":
+        # Both flags, not just the first. #{pane_active} means "active pane of its
+        # own window", which stays 1 for a pane in a window nobody is looking at.
+        # Reading that alone as "already focused" skipped the focus-in nudge for
+        # every target in a background window — exactly the case the nudge exists
+        # for, since that pane's TUI really does believe it is unfocused.
+        # session_attached is a client count, not a flag, so compare it against 0
+        # rather than 1 — a session with two clients is still being looked at.
+        probe = run_tmux(["display-message", "-p", "-t", self.target,
+                          "#{pane_active},#{window_active},#{session_attached}"],
+                         check=False)
+        fields = probe.stdout.strip().split(",")
+        if probe.returncode == 0 and len(fields) == 3 \
+                and fields[0] == "1" and fields[1] == "1" and fields[2] != "0":
             return self
         result = run_tmux(["send-keys", "-t", self.target, "-H", *self.FOCUS_IN], check=False)
         self.notified = result.returncode == 0
@@ -670,7 +698,7 @@ def wait_settled(target: str) -> None:
     previous = None
     deadline = time.time() + SETTLE_TIMEOUT
     while time.time() < deadline:
-        current = run_tmux(["capture-pane", "-p", "-t", target], check=False)
+        current = capture_pane_text(target, check=False)
         if current.returncode != 0:
             return
         if current.stdout == previous:
@@ -691,7 +719,7 @@ def submitted(target: str) -> bool:
     TUI that shows "[Pasted text #1 +42 lines]" never puts the delimiter on
     screen, so the frame would read as submitted the instant it was pasted.
     """
-    result = run_tmux(["capture-pane", "-p", "-t", target, "-S", "-80"], check=False)
+    result = capture_pane_text(target, history=True, check=False)
     if result.returncode != 0:
         return True
     clean = ANSI_RE.sub("", result.stdout)

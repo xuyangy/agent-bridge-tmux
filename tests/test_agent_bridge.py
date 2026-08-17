@@ -774,5 +774,85 @@ class TestSubmitted(unittest.TestCase):
         self.assertTrue(self.pane(screen))
 
 
+class TestCaptureJoinsWrappedLines(unittest.TestCase):
+    """Every pane read must join wrapped rows.
+
+    Without -J, capture-pane splits a long frame at the column boundary, and the
+    split lands inside <<<END_AGENT_MSG>>> often enough to matter: submitted()
+    then misses the delimiter and calls a stuck frame delivered.
+    """
+
+    def calls(self, fn) -> list[list[str]]:
+        seen: list[list[str]] = []
+
+        def record(args, **_k):
+            seen.append(args)
+            return types.SimpleNamespace(returncode=0, stdout="> \n")
+
+        original = ab.run_tmux
+        setattr(ab, "run_tmux", record)
+        try:
+            fn()
+        finally:
+            setattr(ab, "run_tmux", original)
+        return [a for a in seen if a and a[0] == "capture-pane"]
+
+    def test_every_capture_passes_j(self) -> None:
+        for label, fn in (("capture_target", lambda: ab.capture_target("%2")),
+                          ("submitted", lambda: ab.submitted("%2"))):
+            with self.subTest(caller=label):
+                captures = self.calls(fn)
+                self.assertTrue(captures)
+                for args in captures:
+                    self.assertIn("-J", args)
+
+    def test_a_delimiter_split_across_rows_is_read_as_stuck(self) -> None:
+        # What an un-joined capture used to look like, and must never produce a
+        # "submitted" verdict once -J puts the row back together.
+        joined = f"> {ab.FRAME_START} turn=1 >>> body {ab.FRAME_END}\n"
+        original = ab.run_tmux
+        setattr(ab, "run_tmux",
+                lambda *_a, **_k: types.SimpleNamespace(returncode=0, stdout=joined))
+        self.addCleanup(setattr, ab, "run_tmux", original)
+        self.assertFalse(ab.submitted("%2"))
+
+
+class TestFocusProbe(unittest.TestCase):
+    """#{pane_active} alone is 1 for the active pane of a background window, so
+    it cannot stand in for "a human is looking at this pane"."""
+
+    def notified_for(self, probe: str) -> bool:
+        sent: list[list[str]] = []
+
+        def fake(args, **_k):
+            if args and args[0] == "display-message":
+                return types.SimpleNamespace(returncode=0, stdout=probe)
+            sent.append(args)
+            return types.SimpleNamespace(returncode=0, stdout="")
+
+        original = ab.run_tmux
+        setattr(ab, "run_tmux", fake)
+        self.addCleanup(setattr, ab, "run_tmux", original)
+        with ab.Focus("%2"):
+            pass
+        return any(a and a[0] == "send-keys" for a in sent)
+
+    def test_background_window_still_gets_the_focus_nudge(self) -> None:
+        self.assertTrue(self.notified_for("1,0,1"))
+
+    def test_unattached_session_still_gets_the_focus_nudge(self) -> None:
+        self.assertTrue(self.notified_for("1,1,0"))
+
+    def test_inactive_pane_still_gets_the_focus_nudge(self) -> None:
+        self.assertTrue(self.notified_for("0,1,1"))
+
+    def test_a_genuinely_focused_pane_is_left_alone(self) -> None:
+        self.assertFalse(self.notified_for("1,1,1"))
+
+    def test_several_clients_still_count_as_attached(self) -> None:
+        # session_attached is a client count, not a flag.
+        self.assertFalse(self.notified_for("1,1,3"))
+
+
 if __name__ == "__main__":
     unittest.main()
