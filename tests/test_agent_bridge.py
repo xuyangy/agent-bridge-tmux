@@ -11,7 +11,9 @@ Run: python3 -m unittest discover -s tests
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -1291,6 +1293,185 @@ class TestBusyWordingDoesNotOverreach(unittest.TestCase):
                        "✻ Roosting… (44s · thinking)\n"):
             with self.subTest(screen=screen):
                 self.assertFalse(ab.looks_ready(screen))
+
+
+# --- 14. verifying a guessed pane against process ancestry --------------------
+
+
+@contextlib.contextmanager
+def _env(**values: str | None) -> Any:
+    """Set or unset environment variables for the duration of a block."""
+    saved = {k: os.environ.get(k) for k in values}
+    try:
+        for key, value in values.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+class AncestryCase(unittest.TestCase):
+    """A three-pane server: %0 focused, %9 ours, %7 a bystander.
+
+    tmux and the process table are both stubbed, so these run anywhere. The walk
+    still starts from this process's real pid, which keeps the fake table honest
+    about its one real input rather than patching os.getpid out from under it.
+    """
+
+    PANES = {"%0": 43188, "%9": 81541, "%7": 5000}
+
+    def setUp(self) -> None:
+        self.focused = "%0"
+        self.parents: dict[int, int] = {}
+        self.list_panes_fails = False
+
+        def fake_run_tmux(args: list[str], check: bool = True) -> Any:
+            if args[0] == "list-panes":
+                if self.list_panes_fails:
+                    return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+                rows = "".join(f"{p} {pid}\n" for p, pid in self.PANES.items())
+                return types.SimpleNamespace(returncode=0, stdout=rows, stderr="")
+            if args[0] == "display-message":
+                return types.SimpleNamespace(returncode=0, stdout=self.focused + "\n",
+                                             stderr="")
+            raise AssertionError(f"unexpected tmux call: {args}")
+
+        for name, fake in (("run_tmux", fake_run_tmux),
+                           ("parent_pids", lambda: dict(self.parents))):
+            original = getattr(ab, name)
+            setattr(ab, name, fake)
+            self.addCleanup(setattr, ab, name, original)
+
+    def chain(self, *pids: int) -> None:
+        """Make this process a descendant of the given pids, nearest first."""
+        walk = [os.getpid(), *pids]
+        self.parents = {walk[i]: walk[i + 1] for i in range(len(walk) - 1)}
+
+
+class TestPaneOwnership(AncestryCase):
+    def test_our_pane_is_found_through_a_chain_of_ancestors(self) -> None:
+        self.chain(87768, 44294, 81541, 42561)
+        self.assertEqual(ab.pane_owning_this_process(), "%9")
+
+    def test_the_nearest_pane_wins_if_two_ever_appear(self) -> None:
+        """Defensive only: on one server this chain cannot occur.
+
+        tmux spawns each pane's process itself, so pane pids are siblings under
+        the server and at most one can be in any ancestry — checked against a
+        live six-pane server, where all six had the server as parent. This pins
+        the tie-break so the result stays defined if that ever stops holding.
+        """
+        self.chain(5000, 81541, 42561)
+        self.assertEqual(ab.pane_owning_this_process(), "%7")
+
+    def test_a_reparented_process_belongs_to_no_pane(self) -> None:
+        # setsid/daemonised: the chain runs to init without meeting a pane.
+        self.chain(1)
+        self.assertEqual(ab.pane_owning_this_process(), "")
+
+    def test_an_unreadable_process_table_is_not_an_answer(self) -> None:
+        self.parents = {}
+        self.assertEqual(ab.pane_owning_this_process(), "")
+
+    def test_a_cycle_terminates_instead_of_hanging(self) -> None:
+        self.parents = {os.getpid(): 500, 500: 600, 600: 500}
+        self.assertEqual(ab.pane_owning_this_process(), "")
+
+    def test_the_walk_is_depth_bounded(self) -> None:
+        base = 200000
+        depth = ab.MAX_ANCESTRY_DEPTH * 3
+        self.parents = {os.getpid(): base}
+        self.parents.update({base + i: base + i + 1 for i in range(depth)})
+        # The pane pid sits past the cap, so the walk must not reach it.
+        self.parents[base + depth] = 81541
+        self.assertEqual(ab.pane_owning_this_process(), "")
+
+
+class TestGuessedPaneIsVerified(AncestryCase):
+    """The outcomes of detect_identity's pane resolution.
+
+    TMUX_PANE, else the pane our ancestry proves we are in, else (warning) the
+    focused pane. Nothing here is fatal: the fallback is what happened before
+    any of this existed, so no bridge that used to start is refused.
+    """
+
+    def resolve(self, pane: str | None) -> tuple[str, str]:
+        """The resolved pane and whatever was said on stderr."""
+        noise = io.StringIO()
+        with _env(TMUX="/tmp/sock,1,0", TMUX_PANE=pane):
+            with contextlib.redirect_stderr(noise):
+                return ab.detect_identity_pane(), noise.getvalue()
+
+    def test_tmux_pane_set_is_taken_as_authoritative(self) -> None:
+        # Ancestry says %9 and focus says %0; neither is consulted, because an
+        # explicit TMUX_PANE outranks both.
+        self.chain(81541)
+        pane, said = self.resolve("%3")
+        self.assertEqual(pane, "%3")
+        self.assertEqual(said, "")
+
+    def test_unset_but_confirmed_by_ancestry_says_nothing(self) -> None:
+        self.focused = "%9"
+        self.chain(87768, 81541, 42561)
+        pane, said = self.resolve(None)
+        self.assertEqual(pane, "%9")
+        self.assertEqual(said, "", "a derived pane that matches focus is unremarkable")
+
+    def test_ancestry_beats_focus_and_says_so(self) -> None:
+        self.focused = "%0"          # focus is elsewhere...
+        self.chain(87768, 81541)     # ...but we are demonstrably in %9
+        pane, said = self.resolve(None)
+        self.assertEqual(pane, "%9", "we must key state to the pane we are in")
+        self.assertIn("%9", said)
+        self.assertIn("%0", said)
+        self.assertNotIn("warning", said, "adopting the right pane is not a problem")
+
+    def test_inconclusive_ancestry_warns_and_falls_back_to_focus(self) -> None:
+        self.focused = "%0"
+        self.chain(1)                # reparented: no pane in our ancestry
+        pane, said = self.resolve(None)
+        self.assertEqual(pane, "%0")
+        self.assertIn("warning", said)
+
+    def test_the_inconclusive_warning_does_not_bless_the_guess(self) -> None:
+        """It must not hand over `TMUX_PANE=%0` as a ready-made assignment.
+
+        %0 is precisely the value we could not verify, so printing it as a fix
+        would invite a human to make an unverified guess permanent. Point them
+        at the command that derives the answer instead.
+        """
+        self.focused = "%0"
+        self.chain(1)
+        _, said = self.resolve(None)
+        self.assertIn("display-message", said)
+        self.assertNotIn("TMUX_PANE=%0", said)
+
+    def test_a_server_that_cannot_list_panes_still_resolves(self) -> None:
+        self.list_panes_fails = True
+        self.chain(87768, 81541)
+        pane, said = self.resolve(None)
+        self.assertEqual(pane, "%0")
+        self.assertIn("warning", said)
+
+
+class TestParentPids(unittest.TestCase):
+    def test_the_real_process_table_finds_our_own_parent(self) -> None:
+        """Whatever this platform is, we must at least find our own parent."""
+        parents = ab.parent_pids()
+        self.assertTrue(parents, "no process table could be read at all")
+        self.assertEqual(parents.get(os.getpid()), os.getppid())
+
+    def test_our_own_ancestry_reaches_pid_one(self) -> None:
+        chain = ab.ancestor_pids(os.getpid(), ab.parent_pids())
+        self.assertEqual(chain[0], os.getpid())
+        self.assertLessEqual(len(chain), ab.MAX_ANCESTRY_DEPTH)
 
 
 if __name__ == "__main__":

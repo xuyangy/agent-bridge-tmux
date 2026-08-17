@@ -329,22 +329,198 @@ def legacy_bridge_is_live(identity: dict[str, str]) -> dict[str, Any] | None:
     return value
 
 
-def detect_identity() -> dict[str, str]:
-    """Resolve this pane's own address, once, and cache it.
+# How far up the process tree to look before giving up. Real chains are a
+# handful of links; anything approaching this is a malformed snapshot.
+MAX_ANCESTRY_DEPTH = 64
+
+
+def parent_pids() -> dict[int, int]:
+    """Map every visible pid to its parent, in one shot.
+
+    Read /proc where it exists, because that costs no subprocess at all. macOS
+    has none, and the standard library exposes no portable way to ask for another
+    process's parent — os.getppid() answers only for ourselves — so there we do
+    shell out, to `ps`. It is one batched call rather than one per ancestor:
+    walking a chain a step at a time would spawn a dozen processes inside
+    identity detection, which every single command runs.
+
+    `ps -Ao pid=,ppid=` is POSIX and behaves alike on macOS and the BSDs. That is
+    the platform assumption; on anything where it is missing or prints something
+    else, every row fails to parse, the map comes back empty, and the caller
+    treats that as "cannot tell" rather than as an answer.
+    """
+    parents: dict[int, int] = {}
+    proc = Path("/proc")
+    if proc.is_dir():
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                # Field 4 of /proc/<pid>/stat is the ppid. The comm field can
+                # itself contain spaces and parentheses, so split after the last
+                # ')' rather than tokenising the whole line.
+                fields = (entry / "stat").read_text().rpartition(")")[2].split()
+                parents[int(entry.name)] = int(fields[1])
+            except (OSError, ValueError, IndexError):
+                continue
+        return parents
+
+    try:
+        result = subprocess.run(["ps", "-Ao", "pid=,ppid="],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return parents
+    for line in result.stdout.splitlines():
+        try:
+            pid, ppid = line.split()[:2]
+            parents[int(pid)] = int(ppid)
+        except ValueError:
+            continue
+    return parents
+
+
+def ancestor_pids(pid: int, parents: dict[int, int]) -> list[int]:
+    """This pid and its ancestors, nearest first.
+
+    Bounded twice over. A real process tree has no cycles, but this map is a
+    snapshot stitched from many rows, and a pid recycled between two of them can
+    make one appear; a seen-set and a depth cap mean identity detection cannot
+    hang on either.
+    """
+    chain: list[int] = []
+    seen: set[int] = set()
+    while pid > 1 and pid not in seen and len(chain) < MAX_ANCESTRY_DEPTH:
+        chain.append(pid)
+        seen.add(pid)
+        pid = parents.get(pid, 0)
+    return chain
+
+
+def pane_pids() -> dict[str, int]:
+    """Every pane on this server, and the pid of the process tmux started in it."""
+    result = run_tmux(["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"],
+                      check=False)
+    if result.returncode != 0:
+        return {}
+    panes: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and PANE_RE.fullmatch(parts[0]) and parts[1].isdigit():
+            panes[parts[0]] = int(parts[1])
+    return panes
+
+
+def pane_owning_this_process() -> str:
+    """Which pane are we really in, judged by process ancestry?
+
+    tmux starts each pane's command itself, so a pane's `#{pane_pid}` is an
+    ancestor of everything running in that pane and of nothing running in any
+    other. Walking our own ancestry for a pane pid therefore reconstructs what
+    TMUX_PANE would have said, from two things no message can influence: our own
+    process tree, and tmux's own pane list.
+
+    It looks at every pane rather than only the focused one, and that is what
+    separates the two ways of having no answer from the one way of having a
+    wrong one. A reparented process — setsid, a daemonised child — meets no pane
+    pid at all and comes back "", which is honest ignorance. A process in a
+    non-focused pane meets the pid of the pane it is genuinely in, which is an
+    answer. Checking only the focused pane would render both as "no match".
+
+    At most one pane can match, so there is no real ambiguity to resolve. tmux
+    spawns every pane's process itself, which makes pane pids siblings under the
+    server rather than a hierarchy — verified against a live six-pane server,
+    where all six shared the server process as their parent. A nested tmux is not
+    an exception to that: it is a separate socket, and run_tmux is pinned to
+    ours, so the list is always exactly our own server's panes. The loop returns
+    the nearest match regardless, which costs nothing and keeps the result
+    defined without resting on that argument.
+
+    Pid reuse is the one thing that could make this lie, and it is worth being
+    exact about the cost now that callers adopt this answer rather than merely
+    checking it against focus. Our own ancestors are alive by construction: if
+    one exits we are reparented and the chain ends early, which reads as "" and
+    not as a match. A false match would need the kernel to recycle a dead pid
+    into exactly one of our live ancestors' slots in the window between tmux
+    answering and the process snapshot. If that ever happened we would key state
+    to the wrong pane silently, which is the same failure as trusting focus and
+    no worse — but it is silent, where the earlier draft of this made it a loud
+    refusal. That is the price of adopting instead of refusing, paid once
+    against a race that a plain guess loses far more often.
+
+    "" when no pane in our ancestry can be identified.
+    """
+    panes = pane_pids()
+    if not panes:
+        return ""
+    parents = parent_pids()
+    if not parents:
+        return ""
+    owner_of = {pid: pane for pane, pid in panes.items()}
+    for pid in ancestor_pids(os.getpid(), parents):
+        if pid in owner_of:
+            return owner_of[pid]
+    return ""
+
+
+def pane_when_env_unset() -> str:
+    """Resolve our pane when TMUX_PANE is missing: derive it, or fall back.
+
+    display-message resolves to whichever pane currently has focus, which is a
+    guess — a human switching panes changes it. That guess keys the state file,
+    the log and the abort sentinel, so getting it wrong locks a stranger's pane
+    out of starting a bridge, files our log under theirs, and hands the human an
+    abort command that stops their exchange as well as ours. None of that is on
+    the wire, so neither the frame checksum nor the bridge token can see it.
+
+    Ancestry is not a check on that guess so much as a replacement for it.
+    TMUX_PANE means "the pane tmux started this process in", and
+    pane_owning_this_process computes exactly that from our own process tree and
+    tmux's pane list, so when it answers we prefer it outright rather than
+    comparing it with focus. Focus is consulted only to decide whether to say so.
+
+    Nothing here is fatal. When ancestry cannot tell — a reparented or
+    daemonised process meets no pane pid at all — we are no worse off than
+    before this existed, so we keep the old warn-and-proceed rather than
+    refusing a bridge that used to work.
+    """
+    owner = pane_owning_this_process()
+    focused = tmux_value("#{pane_id}")
+    if owner:
+        if owner != focused:
+            print(f"note: TMUX_PANE unset; resolved to pane {owner} by process "
+                  f"ancestry, not to the focused pane {focused}", file=sys.stderr)
+        return owner
+    # Deliberately not "re-run with TMUX_PANE={focused}". This is the one path
+    # where the pane is still a guess, and printing it as a ready-made
+    # assignment would invite a human to make an unverified guess permanent —
+    # the exact mistake the rest of this function exists to stop. Give them the
+    # command that derives the answer instead.
+    print(f"warning: TMUX_PANE unset and process ancestry is inconclusive; "
+          f"falling back to the focused pane {focused}, which is a guess. "
+          f"To make it certain, run  tmux display-message -p '#{{pane_id}}'  in "
+          f"the pane this agent runs in and export TMUX_PANE with that id.",
+          file=sys.stderr)
+    return focused
+
+
+def detect_identity_pane() -> str:
+    """This pane's id: TMUX_PANE when set, otherwise a guess we have checked.
 
     TMUX_PANE is set per pane and inherited by child processes, so it is
-    authoritative. display-message resolves to whichever pane currently has
-    focus, which is a guess — hence the warning when we have to use it.
+    authoritative and is taken as-is. Only when it is missing do we fall back to
+    the focused pane, and then pane_from_focus has to stand behind the answer.
     """
     if not os.environ.get("TMUX"):
         raise BridgeError("Not inside tmux; bridge cannot run.")
-
-    pane = os.environ.get("TMUX_PANE", "")
-    if not pane:
-        pane = tmux_value("#{pane_id}")
-        print(f"warning: TMUX_PANE unset; fell back to active pane {pane}", file=sys.stderr)
+    pane = os.environ.get("TMUX_PANE", "") or pane_when_env_unset()
     if not PANE_RE.fullmatch(pane):
         raise BridgeError(f"invalid self pane id: {pane!r}")
+    return pane
+
+
+def detect_identity() -> dict[str, str]:
+    """Resolve this pane's own address, once, and cache it."""
+    pane = detect_identity_pane()
 
     # `#{socket_path}` arrived in tmux 2.2; an older build returns the format
     # string unexpanded. Fall back to the socket in $TMUX before the server pid,
