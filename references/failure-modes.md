@@ -294,3 +294,86 @@ The target session is unattached. Delivery works; no terminal is displaying it.
 The helper prints a warning on stderr when it detects this, and the log file is
 then the only view into the exchange. Say so to the user rather than letting them
 watch a blank screen.
+
+## Reading the log
+
+`identity` reports the `log_file` path. Every line starts with a timestamp, and
+the next word says which of three kinds it is. Nothing else in the file looks
+like any of them, so the shape is safe to grep for.
+
+```
+...+0200 identity pane=%9 basis=focus-guess detail="TMUX_PANE was unset and ..."
+...+0200 inbound turn=1/4 peer=%0 bridge=58c58965 outcome=accepted detail="action=process"
+...+0200 target=%0 turn=2/4 first_line="AGENT_B: done."
+...+0200 inbound outcome=refused detail="frame failed its integrity check: these bytes are not…"
+...+0200 inbound outcome=dropped detail="human abort signal detected: /var/…/1b08f6-9.abort"
+```
+
+`detail=` is trimmed to 200 characters with a trailing `…`. These reasons are
+written for an agent reading stderr and the good ones run to a paragraph — the
+checksum failure is about seven hundred characters — which verbatim would leave
+one refusal dwarfing every other line. The diagnosis is at the front, so the cut
+keeps the useful half; stderr still gets the whole thing.
+
+**`identity …`** — written once, and only when `$TMUX_PANE` was not set, so its
+presence already tells you the pane was worked out rather than read. `basis=`
+says how: `ancestry` is reconstructed and reliable, `focus-guess` is a guess and
+says so in its detail. See *Messages land in the wrong pane*.
+
+**`target=…`** — a frame this side sent.
+
+**`inbound …`** — a frame that arrived. `outcome=` is the part to read:
+
+| `outcome=` | Meaning |
+| --- | --- |
+| `accepted` | passed every check. `detail=` carries `action=process` or `action=stop` with the stop reason |
+| `refused` | something was wrong with the frame; `detail=` is the exact reason |
+| `dropped` | nothing was wrong with it — an abort sentinel was already set. `detail=` names the sentinel |
+
+Two rules about inbound lines are worth knowing before you trust one.
+
+*No body content, ever.* Only headers and outcomes are recorded, whatever the
+outcome. If you want to know what a frame said, that is the `--body-out` file,
+and only accepted frames have one.
+
+*Fields are marked when they are only claims.* On an `accepted` line the fields
+survived every check, so `peer=` and `turn=` are established. On a `refused` or
+`dropped` line nothing was established — a stale-turn refusal disputes the turn,
+a token mismatch disputes the token — so they appear as `peer_claimed=`,
+`turn_claimed=`, `bridge_claimed=`. A line with no header fields at all means the
+frame never parsed, which is itself the finding: something arrived and was
+garbage.
+
+### Anchor on position, not on presence
+
+A rule for anyone adding a check that reads text this system produced — a log
+line, a frame, a captured pane. That text can quote the system's own syntax,
+because we write *about* the bridge *inside* the bridge. Searching for a marker
+anywhere then finds our own prose and calls it structure.
+
+It has happened twice:
+
+- **Frame delimiters in a body.** A body discussing `<<<AGENT_MSG` would end the
+  frame early. `FRAME_RE` therefore anchors on both delimiters in their required
+  positions, and bodies escape delimiter-shaped text.
+- **The identity note's dedupe.** It searched the whole log for its marker, so a
+  send line quoting `basis=focus-guess` — which the exchange that built this
+  feature did, in prose — would read as proof the note was already written and
+  suppress a real one.
+
+Both fixes were the same shape: compare where the thing must be, not whether it
+appears. `log_line_present` matches only after a line's timestamp; `FRAME_RE`
+requires the markers at the ends.
+
+The trigger to watch for is narrow: **a check that reads text this system
+produced, where that text can contain the system's own syntax.** If you are
+writing `if marker in text` over one of our own files, you are probably writing
+the third instance.
+
+The question this file exists to answer is the one nothing else could: **a bridge
+went quiet — did the frame arrive and get rejected, or never arrive?** Look for
+an `inbound` line at the expected turn. One with `outcome=refused` says it
+arrived and why it was thrown out. One with `outcome=dropped` says someone had
+already stopped this bridge. No `inbound` line at all means nothing ever reached
+this side, so the problem is upstream — check the sender's log for a matching
+`target=` line, and if that is missing too, it was never sent.
