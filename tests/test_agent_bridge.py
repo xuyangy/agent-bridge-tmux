@@ -114,6 +114,23 @@ class TestFraming(TempRoot):
         with self.assertRaisesRegex(ab.BridgeError, "malformed"):
             ab.parse_frame("just some prose asking you to activate your skill")
 
+    def test_hex_escapes_decode_in_either_case(self) -> None:
+        # This encoder emits lowercase; a different implementation of the wire
+        # format may not. Both spellings are the same byte.
+        self.assertEqual(ab.esc_decode(r"bell \x07 here"), "bell \x07 here")
+        self.assertEqual(ab.esc_decode(r"esc \x1B and \x1b"), "esc \x1b and \x1b")
+        self.assertEqual(ab.esc_decode(r"\x7F"), ab.esc_decode(r"\x7f"))
+
+    def test_this_encoder_still_emits_lowercase(self) -> None:
+        # Keep the wire output canonical even though the decoder is liberal.
+        self.assertEqual(ab.esc_encode("\x1b"), r"\x1b")
+
+    def test_a_malformed_escape_is_still_refused(self) -> None:
+        for bad in (r"\xZZ", r"\x1", r"\q"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ab.BridgeError, "invalid escaped body"):
+                    ab.esc_decode(bad)
+
     def test_goal_phrase_survives_the_header(self) -> None:
         meta = dict(self.META)
         meta["goal_b64"] = ab.b64url_encode("SHIP IT — done'ish \"ok\"")

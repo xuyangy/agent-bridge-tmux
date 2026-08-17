@@ -388,7 +388,11 @@ def esc_decode(body: str) -> str:
         elif body[i + 1:i + 2] in UNESC_MAP:
             out.append(UNESC_MAP[body[i + 1]])
             i += 2
-        elif body[i + 1:i + 2] == "x" and re.fullmatch(r"[0-9a-f]{2}", body[i + 2:i + 4]):
+        # Accept either case. This encoder emits lowercase (`:02x`), and the
+        # checksum means a frame cannot be rewritten in transit, so uppercase can
+        # only come from a different implementation of the wire format. Both
+        # spellings mean the same byte, so refusing one buys nothing.
+        elif body[i + 1:i + 2] == "x" and re.fullmatch(r"[0-9a-fA-F]{2}", body[i + 2:i + 4]):
             out.append(chr(int(body[i + 2:i + 4], 16)))
             i += 4
         else:

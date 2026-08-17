@@ -141,7 +141,7 @@ atomic paste, so there are no keystrokes to drop. If you have set
 python3 -m unittest discover -s tests
 ```
 
-64 tests, no dependencies, no tmux server needed — they stub the transport and
+67 tests, no dependencies, no tmux server needed — they stub the transport and
 check framing, the integrity checksum, the state machine, turn bounds, timeouts,
 and the submit check. They do not prove delivery; that part is checked against a
 real pane by hand.
