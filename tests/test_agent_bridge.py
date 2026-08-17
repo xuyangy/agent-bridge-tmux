@@ -1063,5 +1063,59 @@ class TestLegacyPathDetection(TempRoot):
         self.assertEqual(found["legacy_abort_file"], "")
 
 
+class TestDiagnosticMessages(TempRoot):
+    """The three failures below are the ones actually seen in the field, all of
+    them the receiving agent altering the frame as it copied it. The old messages
+    blamed the transport, and a reader following that advice tuned paste settings
+    that were never the problem."""
+
+    META = {"turn": "1", "max": "4", "reply_to": "%2", "server": SOCKET,
+            "bridge": "a" * 32}
+
+    def frame(self, body: str = "line one\nline two") -> str:
+        return ab.render_frame(dict(self.META), body)
+
+    def error_for(self, raw: str) -> str:
+        with self.assertRaises(ab.BridgeError) as caught:
+            ab.parse_frame(raw)
+        return str(caught.exception)
+
+    def test_a_decoded_frame_is_named_as_multi_line(self) -> None:
+        # Seen twice: the agent expanded the \n escapes, turning one line into 63.
+        message = self.error_for(self.frame().replace("\\n", "\n"))
+        self.assertIn("lines", message)
+        self.assertIn("one line", message)
+        self.assertNotIn("CHUNK_PAUSE", message, "this is not a transport problem")
+
+    def test_a_clipped_tail_is_named_as_clipped(self) -> None:
+        # Seen once: the final ">" was dropped, so the closing marker arrived one
+        # bracket short and the parser could not find the end at all.
+        message = self.error_for(self.frame()[:-1])
+        self.assertIn("clipped", message)
+
+    def test_a_missing_head_is_named(self) -> None:
+        message = self.error_for(self.frame()[20:])
+        self.assertIn("does not start with", message)
+
+    def test_a_reflowed_frame_fails_the_checksum_not_the_parser(self) -> None:
+        # Seen twice: an escape and a space swapped places. The frame still parses
+        # structurally, so the checksum is what must catch it.
+        frame = self.frame("alpha\n   beta gamma")
+        reflowed = frame.replace("alpha\\n   beta", "alpha beta\\n   ")
+        self.assertNotEqual(reflowed, frame, "the test must actually mutate it")
+        message = self.error_for(reflowed)
+        self.assertIn("integrity check", message)
+        self.assertIn("not the bytes that were sent", message)
+
+    def test_the_integrity_message_leads_with_the_copy_not_the_transport(self) -> None:
+        # Alter one character inside the body, leaving the delimiters intact, so
+        # the frame parses structurally and it is the checksum that objects.
+        broken = self.frame().replace("line one", "lime one")
+        message = self.error_for(broken)
+        self.assertIn("integrity check", message)
+        self.assertLess(message.index("copy"), message.index("transport"),
+                        "the likely cause must come before the unlikely one")
+
+
 if __name__ == "__main__":
     unittest.main()

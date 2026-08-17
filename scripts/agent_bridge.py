@@ -555,10 +555,40 @@ def render_frame(meta: dict[str, str], body: str) -> str:
     return f"{FRAME_START} {header}>>> {encoded_body} {FRAME_END}"
 
 
+def malformed_hint(raw: str) -> str:
+    """Name the likely reason a frame did not parse, from the text itself.
+
+    "malformed agent bridge frame" on its own sent a reader looking at the
+    transport, which was never the problem: observed causes are all in the copy
+    — the escapes decoded so a one-line frame became sixty, or the last
+    character clipped so the closing delimiter arrived one bracket short. The
+    reader cannot tell those apart from the bare message, so say which it is.
+    """
+    stripped = raw.strip()
+    lines = stripped.count("\n") + 1
+    if lines > 1:
+        return (f"it is {lines} lines. A frame is exactly one line, and the "
+                f"backslash-n pairs in it are two literal characters, not line "
+                f"breaks. Save the frame again exactly as it appears, without "
+                f"decoding anything")
+    if not stripped.startswith(FRAME_START):
+        return (f"it does not start with {FRAME_START}. Save from the opening "
+                f"marker through the closing marker, with nothing added or trimmed")
+    if not stripped.endswith(FRAME_END):
+        tail = stripped[-len(FRAME_END):]
+        return (f"it does not end with {FRAME_END}; it ends {tail!r}. The tail "
+                f"was clipped or altered in the copy. Save it again, to the last "
+                f"character")
+    if FRAME_START in stripped[len(FRAME_START):] or stripped.count(FRAME_END) > 1:
+        return ("it contains more than one frame delimiter. Save one frame only")
+    return ("the delimiters are present but the header between them is not "
+            "readable. Something inside the frame was altered in the copy")
+
+
 def parse_frame(raw: str) -> tuple[dict[str, str], str]:
     matches = list(FRAME_RE.finditer(raw))
     if not matches:
-        raise BridgeError("malformed agent bridge frame")
+        raise BridgeError(f"malformed agent bridge frame: {malformed_hint(raw)}")
     if len(matches) > 1:
         raise BridgeError("input contains more than one frame; refusing to guess")
     match = matches[0]
@@ -587,10 +617,17 @@ def parse_frame(raw: str) -> tuple[dict[str, str], str]:
     if not re.fullmatch(r"[0-9a-f]{12}", claimed) \
             or claimed != frame_digest(meta, match.group("body")):
         raise BridgeError(
-            "frame failed its integrity check: characters were dropped or "
-            "corrupted in transit. Do not process the body. The sender must "
-            "retry — with AGENT_BRIDGE_TYPE=paste or a larger "
-            "AGENT_BRIDGE_CHUNK_PAUSE if it keeps happening."
+            "frame failed its integrity check: these bytes are not the bytes that "
+            "were sent. Do not process the body and do not try to repair it. The "
+            "usual cause is the copy, not the transport: the frame was saved with "
+            "something changed — text re-wrapped so an escape and a space swapped "
+            "places, an escape decoded, a character clipped off the end. If you "
+            "retyped or reformatted the frame, save it again byte for byte from "
+            "the prompt instead. Ask the sender for a short frame that names a "
+            "file to read, which removes the copy entirely. Only if the sender "
+            "sees this repeatedly with a verbatim copy is it the transport, and "
+            "then AGENT_BRIDGE_TYPE=paste or a larger AGENT_BRIDGE_CHUNK_PAUSE "
+            "is the lever."
         )
 
     required = {"turn", "max", "reply_to", "server", "bridge"}
