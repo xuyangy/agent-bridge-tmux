@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Bridge (tmux)"
+  short_description: "Bounded two-way agent exchange between tmux panes"
+  default_prompt: "Use $agent-bridge-tmux with TARGET_PANE (or the tmux window to bridge to), TASK, and optional MAX_TURNS and GOAL_PHRASE."
