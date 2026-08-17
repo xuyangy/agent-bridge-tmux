@@ -334,37 +334,63 @@ def legacy_bridge_is_live(identity: dict[str, str]) -> dict[str, Any] | None:
 MAX_ANCESTRY_DEPTH = 64
 
 
-def parent_pids() -> dict[int, int]:
-    """Map every visible pid to its parent, in one shot.
+def read_proc_parents(root: Path) -> dict[int, int]:
+    """Parse a /proc tree into pid -> ppid. Separate so it can be tested.
 
-    Read /proc where it exists, because that costs no subprocess at all. macOS
-    has none, and the standard library exposes no portable way to ask for another
-    process's parent — os.getppid() answers only for ourselves — so there we do
-    shell out, to `ps`. It is one batched call rather than one per ancestor:
-    walking a chain a step at a time would spawn a dozen processes inside
-    identity detection, which every single command runs.
+    `/proc/<pid>/stat` is `pid (comm) state ppid ...`, and comm is the only
+    hostile part: it is the executable name, unquoted and unescaped, so it can
+    contain spaces and parentheses alike. Tokenising the whole line breaks on
+    both. Splitting after the LAST ')' is what makes `(weird) name)` parse
+    correctly, and that case is the reason this is not a str.split().
 
-    `ps -Ao pid=,ppid=` is POSIX and behaves alike on macOS and the BSDs. That is
-    the platform assumption; on anything where it is missing or prints something
-    else, every row fails to parse, the map comes back empty, and the caller
-    treats that as "cannot tell" rather than as an answer.
+    Anything unparseable is skipped rather than guessed at. A row we cannot read
+    contributes nothing; it must never contribute a wrong parent.
     """
     parents: dict[int, int] = {}
-    proc = Path("/proc")
-    if proc.is_dir():
-        for entry in proc.iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                # Field 4 of /proc/<pid>/stat is the ppid. The comm field can
-                # itself contain spaces and parentheses, so split after the last
-                # ')' rather than tokenising the whole line.
-                fields = (entry / "stat").read_text().rpartition(")")[2].split()
-                parents[int(entry.name)] = int(fields[1])
-            except (OSError, ValueError, IndexError):
-                continue
+    try:
+        entries = list(root.iterdir())
+    except OSError:
         return parents
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rpartition(")")[2].split()
+            parents[int(entry.name)] = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return parents
 
+
+def parent_pids(*, proc_root: Path = Path("/proc")) -> dict[int, int]:
+    """Map every visible pid to its parent, in one shot.
+
+    Prefer /proc, which costs no subprocess at all. macOS has none, and the
+    standard library exposes no portable way to ask for another process's parent
+    — os.getppid() answers only for ourselves — so otherwise shell out to `ps`.
+    One batched call, not one per ancestor: walking a chain a step at a time
+    would spawn a dozen processes inside identity detection, which every command
+    runs.
+
+    The /proc result has to contain US to be believed. That self-check is cheap
+    and it is the only thing standing between a wrong model of /proc and a silent
+    wrong answer: this code was written on a machine with no /proc, so on Linux
+    the parse above runs for the first time in front of a real user. If it comes
+    back without our own pid in it, it is not merely incomplete, it is not
+    working — so fall through to `ps` rather than report a map we know is wrong.
+
+    `ps -Ao pid=,ppid=` is POSIX and behaves alike on macOS and the BSDs. That is
+    the platform assumption; where it is missing or prints something else every
+    row fails to parse, the map comes back empty, and the caller reads that as
+    "cannot tell" rather than as an answer. `ps` gets a 10s timeout: on the unset
+    path a slow answer beats a wrong one, so this is deliberately not fail-fast.
+    """
+    if proc_root.is_dir():
+        parents = read_proc_parents(proc_root)
+        if os.getpid() in parents:
+            return parents
+
+    parents = {}
     try:
         result = subprocess.run(["ps", "-Ao", "pid=,ppid="],
                                 capture_output=True, text=True, timeout=10)
@@ -420,11 +446,19 @@ def pane_owning_this_process() -> str:
     process tree, and tmux's own pane list.
 
     It looks at every pane rather than only the focused one, and that is what
-    separates the two ways of having no answer from the one way of having a
-    wrong one. A reparented process — setsid, a daemonised child — meets no pane
-    pid at all and comes back "", which is honest ignorance. A process in a
-    non-focused pane meets the pid of the pane it is genuinely in, which is an
-    answer. Checking only the focused pane would render both as "no match".
+    separates having no answer from having a wrong one. A process whose chain no
+    longer reaches its pane meets no pane pid at all and comes back "", which is
+    honest ignorance. A process in a non-focused pane meets the pid of the pane
+    it is genuinely in, which is an answer. Checking only the focused pane would
+    render both as "no match".
+
+    What actually breaks the chain is losing the parent, not detaching from the
+    terminal — a distinction worth stating because the two get conflated.
+    Measured here: a child that called setsid() was a session leader with no
+    controlling terminal, and its chain still ran through its pane's pid, so it
+    resolved correctly. Only the double-fork case, where the intermediate parent
+    exits and init adopts the grandchild, produced a chain of length one and no
+    answer. setsid alone does not defeat this; orphaning does.
 
     At most one pane can match, so there is no real ambiguity to resolve. tmux
     spawns every pane's process itself, which makes pane pids siblings under the
@@ -478,10 +512,10 @@ def pane_when_env_unset() -> str:
     tmux's pane list, so when it answers we prefer it outright rather than
     comparing it with focus. Focus is consulted only to decide whether to say so.
 
-    Nothing here is fatal. When ancestry cannot tell — a reparented or
-    daemonised process meets no pane pid at all — we are no worse off than
-    before this existed, so we keep the old warn-and-proceed rather than
-    refusing a bridge that used to work.
+    Nothing here is fatal. When ancestry cannot tell — an orphaned process, one
+    whose parent exited and left init holding it, meets no pane pid at all — we
+    are no worse off than before this existed, so we keep the old warn-and-
+    proceed rather than refusing a bridge that used to work.
     """
     owner = pane_owning_this_process()
     focused = tmux_value("#{pane_id}")

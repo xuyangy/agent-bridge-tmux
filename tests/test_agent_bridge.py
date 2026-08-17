@@ -1474,5 +1474,106 @@ class TestParentPids(unittest.TestCase):
         self.assertLessEqual(len(chain), ab.MAX_ANCESTRY_DEPTH)
 
 
+class TestProcParse(TempRoot):
+    """The /proc parse, against fixtures, on any platform.
+
+    This code was written on macOS, where the /proc branch never executes, so
+    without these it would first run in front of a real Linux user. Fixtures test
+    the parser that was actually written rather than the kernel's ability to feed
+    it.
+    """
+
+    def proc(self, entries: dict[str, str | None]) -> Path:
+        """Build a fake /proc. A None value means "unreadable stat"."""
+        root = self.root / "proc"
+        root.mkdir()
+        for name, contents in entries.items():
+            entry = root / name
+            entry.mkdir()
+            if contents is None:
+                # A directory where the stat file should be: read_text raises
+                # IsADirectoryError, which is an OSError.
+                (entry / "stat").mkdir()
+            else:
+                (entry / "stat").write_text(contents)
+        return root
+
+    def test_an_ordinary_line(self) -> None:
+        root = self.proc({"100": "100 (bash) S 42 100 100 0 -1 4194304 100 0\n"})
+        self.assertEqual(ab.read_proc_parents(root), {100: 42})
+
+    def test_a_comm_containing_spaces(self) -> None:
+        root = self.proc({"101": "101 (my long name) S 43 101 101 0 -1 0 0 0\n"})
+        self.assertEqual(ab.read_proc_parents(root), {101: 43})
+
+    def test_a_comm_containing_a_close_parenthesis(self) -> None:
+        """The case rpartition exists for, and the one a naive parser fails."""
+        root = self.proc({"102": "102 (weird) name) S 44 102 102 0 -1 0 0 0\n"})
+        self.assertEqual(ab.read_proc_parents(root), {102: 44},
+                         "must split on the LAST ')', not the first")
+
+    def test_a_comm_that_is_only_parentheses(self) -> None:
+        root = self.proc({"103": "103 ()()) S 45 103 103 0 -1 0 0 0\n"})
+        self.assertEqual(ab.read_proc_parents(root), {103: 45})
+
+    def test_a_truncated_line_is_skipped(self) -> None:
+        root = self.proc({"104": "104 (trunc)"})
+        self.assertEqual(ab.read_proc_parents(root), {})
+
+    def test_a_non_numeric_entry_is_skipped(self) -> None:
+        root = self.proc({"self": "1 (init) S 0 1 1 0 -1 0 0 0\n",
+                          "cpuinfo": "not a process at all"})
+        self.assertEqual(ab.read_proc_parents(root), {})
+
+    def test_an_unreadable_stat_is_skipped_not_fatal(self) -> None:
+        root = self.proc({"105": None,
+                          "106": "106 (ok) S 47 106 106 0 -1 0 0 0\n"})
+        self.assertEqual(ab.read_proc_parents(root), {106: 47},
+                         "one bad entry must not lose the others")
+
+    def test_a_missing_root_is_empty_not_an_exception(self) -> None:
+        self.assertEqual(ab.read_proc_parents(self.root / "nope"), {})
+
+    def test_a_whole_tree_parses(self) -> None:
+        root = self.proc({
+            "1": "1 (systemd) S 0 1 1 0 -1 0 0 0\n",
+            "200": "200 (tmux: server) S 1 200 200 0 -1 0 0 0\n",
+            "300": "300 (zsh) S 200 300 300 0 -1 0 0 0\n",
+            "400": "400 (python3) R 300 300 300 0 -1 0 0 0\n",
+        })
+        parents = ab.read_proc_parents(root)
+        self.assertEqual(parents, {1: 0, 200: 1, 300: 200, 400: 300})
+        self.assertEqual(ab.ancestor_pids(400, parents), [400, 300, 200])
+
+
+class TestProcSelfCheck(TempRoot):
+    """A /proc map that does not contain us is not trusted."""
+
+    def build(self, entries: dict[str, str]) -> Path:
+        root = self.root / "proc"
+        root.mkdir()
+        for name, contents in entries.items():
+            (root / name).mkdir()
+            (root / name / "stat").write_text(contents)
+        return root
+
+    def test_a_proc_map_holding_our_own_pid_is_used_as_is(self) -> None:
+        me, mine = os.getpid(), os.getppid()
+        root = self.build({str(me): f"{me} (probe) R {mine} {me} {me} 0 -1 0 0 0\n"})
+        self.assertEqual(ab.parent_pids(proc_root=root), {me: mine})
+
+    def test_a_proc_map_without_us_falls_back_to_ps(self) -> None:
+        """If the parse cannot find us it is broken, not merely incomplete."""
+        root = self.build({"999999": "999999 (ghost) S 1 1 1 0 -1 0 0 0\n"})
+        parents = ab.parent_pids(proc_root=root)
+        self.assertNotEqual(parents, {999999: 1}, "must not trust a map missing us")
+        self.assertEqual(parents.get(os.getpid()), os.getppid(),
+                         "the ps fallback must have supplied the real table")
+
+    def test_no_proc_at_all_uses_ps(self) -> None:
+        parents = ab.parent_pids(proc_root=self.root / "absent")
+        self.assertEqual(parents.get(os.getpid()), os.getppid())
+
+
 if __name__ == "__main__":
     unittest.main()
