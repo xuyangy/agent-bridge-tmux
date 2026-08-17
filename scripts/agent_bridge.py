@@ -333,6 +333,13 @@ def legacy_bridge_is_live(identity: dict[str, str]) -> dict[str, Any] | None:
 # handful of links; anything approaching this is a malformed snapshot.
 MAX_ANCESTRY_DEPTH = 64
 
+# How this pane's id was arrived at. Three values, not two, because "derived and
+# certain" and "guessed and unverified" are different claims and a reader who
+# cannot tell them apart has the wrong picture in exactly the case that bites.
+BASIS_ENV = "env"              # $TMUX_PANE, authoritative
+BASIS_ANCESTRY = "ancestry"    # reconstructed from our own process tree
+BASIS_GUESS = "focus-guess"    # the focused pane, unverified
+
 
 def read_proc_parents(root: Path) -> dict[int, int]:
     """Parse a /proc tree into pid -> ppid. Separate so it can be tested.
@@ -502,8 +509,11 @@ def pane_owning_this_process() -> str:
     return ""
 
 
-def pane_when_env_unset() -> str:
+def pane_when_env_unset() -> tuple[str, str, str]:
     """Resolve our pane when TMUX_PANE is missing: derive it, or fall back.
+
+    Returns the pane, the basis it rests on, and the pane that held focus, so a
+    caller can record which of the two derived routes produced this answer.
 
     display-message resolves to whichever pane currently has focus, which is a
     guess — a human switching panes changes it. That guess keys the state file,
@@ -529,7 +539,7 @@ def pane_when_env_unset() -> str:
         if owner != focused:
             print(f"note: TMUX_PANE unset; resolved to pane {owner} by process "
                   f"ancestry, not to the focused pane {focused}", file=sys.stderr)
-        return owner
+        return owner, BASIS_ANCESTRY, focused
     # Deliberately not "re-run with TMUX_PANE={focused}". This is the one path
     # where the pane is still a guess, and printing it as a ready-made
     # assignment would invite a human to make an unverified guess permanent —
@@ -540,27 +550,33 @@ def pane_when_env_unset() -> str:
           f"To make it certain, run  tmux display-message -p '#{{pane_id}}'  in "
           f"the pane this agent runs in and export TMUX_PANE with that id.",
           file=sys.stderr)
-    return focused
+    return focused, BASIS_GUESS, focused
 
 
-def detect_identity_pane() -> str:
-    """This pane's id: TMUX_PANE when set, otherwise a guess we have checked.
+def detect_identity_pane() -> tuple[str, str, str]:
+    """This pane's id, how we know it, and what had focus at the time.
 
     TMUX_PANE is set per pane and inherited by child processes, so it is
     authoritative and is taken as-is. Only when it is missing do we fall back to
-    the focused pane, and then pane_from_focus has to stand behind the answer.
+    the focused pane, and then pane_when_env_unset has to stand behind the answer.
+
+    The basis is returned rather than only printed because stderr is the wrong
+    place for it to end its life: it scrolls away, and for an unattached session
+    nobody is watching it at all. Callers put it where it survives.
     """
     if not os.environ.get("TMUX"):
         raise BridgeError("Not inside tmux; bridge cannot run.")
-    pane = os.environ.get("TMUX_PANE", "") or pane_when_env_unset()
+    env_pane = os.environ.get("TMUX_PANE", "")
+    pane, basis, focused = ((env_pane, BASIS_ENV, "") if env_pane
+                            else pane_when_env_unset())
     if not PANE_RE.fullmatch(pane):
         raise BridgeError(f"invalid self pane id: {pane!r}")
-    return pane
+    return pane, basis, focused
 
 
 def detect_identity() -> dict[str, str]:
     """Resolve this pane's own address, once, and cache it."""
-    pane = detect_identity_pane()
+    pane, pane_basis, focused_at_detect = detect_identity_pane()
 
     # `#{socket_path}` arrived in tmux 2.2; an older build returns the format
     # string unexpanded. Fall back to the socket in $TMUX before the server pid,
@@ -611,6 +627,11 @@ def detect_identity() -> dict[str, str]:
             raise BridgeError("cached tmux identity conflicts with current pane/server")
     else:
         atomic_json(identity_file, identity)
+    # Set after the cache is written, deliberately. How this run worked out its
+    # own pane is a fact about this run, not about the pane, and a cache that
+    # claimed otherwise would be read by a later process as though it applied.
+    identity["pane_basis"] = pane_basis
+    identity["focused_at_detect"] = focused_at_detect
     return identity
 
 
@@ -618,8 +639,13 @@ def identity_payload(identity: dict[str, str]) -> dict[str, Any]:
     keys = ("self_pane", "self_socket", "state_file", "log_file",
             "abort_file", "global_abort_file", "abort_command", "abort_all_command")
     payload: dict[str, Any] = {key: identity[key] for key in keys}
-    # Only worth reporting when there is something there; an empty pair of keys on
-    # every single command would be noise the agent has to read past each turn.
+    # Reported only when the pane was not simply read from TMUX_PANE. The agent
+    # reads this payload and repeats self_pane to a human; on the guessed path it
+    # would otherwise state a guess as a fact, and the stderr warning that says
+    # so is not what gets quoted. Absent on the common path, so that path's output
+    # is unchanged.
+    if identity.get("pane_basis", BASIS_ENV) != BASIS_ENV:
+        payload["pane_basis"] = identity["pane_basis"]
     for key in ("legacy_state_file", "legacy_abort_file", "legacy_global_abort_file"):
         if identity.get(key):
             payload[key] = identity[key]
@@ -1260,6 +1286,62 @@ def send_or_release(identity: dict[str, str], target: str,
         raise
 
 
+def log_identity_basis(identity: dict[str, str]) -> None:
+    """Record how this pane's id was decided, in the log, once.
+
+    A log answers "what did this bridge send". It could not answer "why is this
+    log in this file", and for an unattached session that is the only question a
+    human has any way to ask, because stderr had no one watching it. The basis
+    belongs where the evidence already lives.
+
+    Nothing is written for TMUX_PANE, which is the overwhelmingly common path and
+    was never in doubt. The two derived cases are logged separately and worded
+    differently on purpose: ancestry is a reconstruction of the authoritative
+    value, while the fallback is a guess that may simply be wrong, and a reader
+    who cannot tell those apart has the wrong picture precisely when it matters.
+
+    Once per log rather than once per send, and dedupe is against the file rather
+    than a flag in this process, because every turn runs a NEW process — a
+    per-process guard would still write a line per turn, which is the noise the
+    constraint exists to prevent. Matching the exact pane-and-basis text also
+    means a genuine change of basis between runs is recorded rather than hidden.
+    """
+    basis = identity.get("pane_basis", BASIS_ENV)
+    if basis == BASIS_ENV:
+        return
+
+    pane = identity["self_pane"]
+    marker = f"identity pane={pane} basis={basis}"
+    if basis == BASIS_ANCESTRY:
+        focused = identity.get("focused_at_detect", "")
+        where = f" focused_was={focused}" if focused and focused != pane else ""
+        detail = ("TMUX_PANE was unset; this pane was reconstructed from our own "
+                  "process ancestry, which is what TMUX_PANE would have said")
+    else:
+        where = ""
+        detail = ("TMUX_PANE was unset and process ancestry was inconclusive, so "
+                  "this pane is the one that held focus and is UNVERIFIED; these "
+                  "files may belong to another pane. Set TMUX_PANE to settle it")
+
+    path = Path(identity["log_file"])
+    try:
+        if path.exists() and marker in path.read_text(encoding="utf-8"):
+            return
+    except OSError:
+        # An unreadable log is not a reason to skip the note; a duplicate line is
+        # a far smaller problem than a missing explanation.
+        pass
+    # Leads with "identity", where every other line leads with "target=", so
+    # neither shape can be mistaken for the other.
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {marker}{where} detail={json.dumps(detail)}"
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError as exc:
+        print(f"agent-bridge: could not record identity basis in the log: {exc}",
+              file=sys.stderr)
+
+
 def send_message(identity: dict[str, str], target: str, meta: dict[str, str], body: str) -> float:
     if target == identity["self_pane"]:
         raise BridgeError("refusing to bridge a pane to itself")
@@ -1270,6 +1352,7 @@ def send_message(identity: dict[str, str], target: str, meta: dict[str, str], bo
     deliver(target, msg)
 
     deadline = time.time() + DEFAULT_ACK_TIMEOUT
+    log_identity_basis(identity)
     log_line = (f"target={target} turn={meta['turn']}/{meta['max']} "
                 f"first_line={json.dumps(first_line(body), ensure_ascii=False)}")
     with Path(identity["log_file"]).open("a", encoding="utf-8") as handle:

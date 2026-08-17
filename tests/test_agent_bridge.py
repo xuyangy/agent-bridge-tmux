@@ -1414,7 +1414,8 @@ class TestGuessedPaneIsVerified(AncestryCase):
         noise = io.StringIO()
         with _env(TMUX="/tmp/sock,1,0", TMUX_PANE=pane):
             with contextlib.redirect_stderr(noise):
-                return ab.detect_identity_pane(), noise.getvalue()
+                resolved, self.basis, _ = ab.detect_identity_pane()
+                return resolved, noise.getvalue()
 
     def test_tmux_pane_set_is_taken_as_authoritative(self) -> None:
         # Ancestry says %9 and focus says %0; neither is consulted, because an
@@ -1519,6 +1520,128 @@ class TestResolvedPaneKeysTheFiles(AncestryCase):
         identity = self.resolve_identity()
         self.assertIn("-9.abort", identity["abort_command"])
         self.assertNotIn("-11.abort", identity["abort_command"])
+
+
+class TestIdentityBasisInTheLog(TempRoot):
+    """Why this log lives in this file, answerable from the log itself.
+
+    For an unattached session the log is the only view there is, and stderr had
+    nobody watching it, so a basis that only ever reached stderr is a basis that
+    was never recorded at all.
+    """
+
+    def identity(self, basis: str, focused: str = "") -> dict[str, str]:
+        identity = make_identity(self.root, "%9")
+        if basis != ab.BASIS_ENV:
+            identity["pane_basis"] = basis
+            identity["focused_at_detect"] = focused
+        return identity
+
+    def log_of(self, identity: dict[str, str]) -> str:
+        path = Path(identity["log_file"])
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def test_the_common_path_writes_nothing(self) -> None:
+        identity = self.identity(ab.BASIS_ENV)
+        ab.log_identity_basis(identity)
+        self.assertEqual(self.log_of(identity), "",
+                         "TMUX_PANE was never in doubt; the log must not grow a line")
+
+    def test_an_adopted_pane_is_recorded_with_what_had_focus(self) -> None:
+        identity = self.identity(ab.BASIS_ANCESTRY, focused="%11")
+        ab.log_identity_basis(identity)
+        written = self.log_of(identity)
+        self.assertIn("basis=ancestry", written)
+        self.assertIn("focused_was=%11", written)
+        self.assertNotIn("UNVERIFIED", written, "a derived pane is not a guess")
+
+    def test_a_fallback_pane_is_recorded_as_unverified(self) -> None:
+        identity = self.identity(ab.BASIS_GUESS)
+        ab.log_identity_basis(identity)
+        written = self.log_of(identity)
+        self.assertIn("basis=focus-guess", written)
+        self.assertIn("UNVERIFIED", written)
+        self.assertIn("TMUX_PANE", written, "must say what would settle it")
+
+    def test_the_two_derived_cases_do_not_read_alike(self) -> None:
+        """The distinction is the point; identical wording would defeat it."""
+        adopted, guessed = self.identity(ab.BASIS_ANCESTRY), self.identity(ab.BASIS_GUESS)
+        guessed["log_file"] = str(self.root / "other.log")
+        ab.log_identity_basis(adopted)
+        ab.log_identity_basis(guessed)
+        self.assertNotEqual(self.log_of(adopted).split(" ", 1)[1],
+                            self.log_of(guessed).split(" ", 1)[1])
+
+    def test_it_is_written_once_per_log_not_once_per_send(self) -> None:
+        """Every turn is a fresh process, so a per-process flag would not do."""
+        identity = self.identity(ab.BASIS_GUESS)
+        for _ in range(4):
+            ab.log_identity_basis(identity)
+        lines = [ln for ln in self.log_of(identity).splitlines() if "identity pane=" in ln]
+        self.assertEqual(len(lines), 1, "repeated every turn, this is noise")
+
+    def test_a_changed_basis_between_runs_is_still_recorded(self) -> None:
+        """Deduping must not hide a real change of how identity was decided."""
+        first = self.identity(ab.BASIS_GUESS)
+        ab.log_identity_basis(first)
+        second = self.identity(ab.BASIS_ANCESTRY, focused="%11")
+        second["log_file"] = first["log_file"]
+        ab.log_identity_basis(second)
+        lines = [ln for ln in self.log_of(first).splitlines() if "identity pane=" in ln]
+        self.assertEqual(len(lines), 2)
+
+    def test_the_note_cannot_be_read_as_a_send(self) -> None:
+        identity = self.identity(ab.BASIS_GUESS)
+        ab.log_identity_basis(identity)
+        body = self.log_of(identity).split(" ", 1)[1]
+        self.assertTrue(body.startswith("identity "))
+        self.assertNotIn("target=", body, "an OUTBOUND line must stay unambiguous")
+
+    def test_an_unwritable_log_warns_rather_than_killing_the_send(self) -> None:
+        identity = self.identity(ab.BASIS_GUESS)
+        identity["log_file"] = str(self.root / "no-such-dir" / "x.log")
+        noise = io.StringIO()
+        with contextlib.redirect_stderr(noise):
+            ab.log_identity_basis(identity)     # must not raise
+        self.assertIn("identity basis", noise.getvalue())
+
+
+class TestSendMessageRecordsTheBasis(TempRoot):
+    """The wiring, not just the function.
+
+    A log helper that is never called is the same bug as one that writes the
+    wrong thing, and only a test through send_message can tell them apart.
+    """
+
+    def send(self, identity: dict[str, str]) -> None:
+        for name, fake in (("wait_ready", lambda target: None),
+                           ("check_abort", lambda ident: None),
+                           ("deliver", lambda target, msg: None),
+                           ("tmux_value", lambda fmt, target=None: "1")):
+            original = getattr(ab, name)
+            setattr(ab, name, fake)
+            self.addCleanup(setattr, ab, name, original)
+        meta = {"turn": "1", "max": "4", "reply_to": "%9", "server": SOCKET,
+                "bridge": "c" * 32}
+        # send_message prints its OUTBOUND line; keep it out of the suite output.
+        with contextlib.redirect_stdout(io.StringIO()):
+            ab.send_message(identity, "%0", meta, "a body")
+
+    def test_a_guessed_pane_is_explained_before_the_first_send(self) -> None:
+        identity = make_identity(self.root, "%9")
+        identity["pane_basis"] = ab.BASIS_GUESS
+        self.send(identity)
+        lines = Path(identity["log_file"]).read_text(encoding="utf-8").splitlines()
+        self.assertIn("identity pane=%9 basis=focus-guess", lines[0])
+        self.assertIn("target=%0", lines[1])
+        self.assertEqual(len(lines), 2)
+
+    def test_the_common_path_logs_only_the_send(self) -> None:
+        identity = make_identity(self.root, "%9")
+        self.send(identity)
+        lines = Path(identity["log_file"]).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("target=%0", lines[0])
 
 
 class TestParentPids(unittest.TestCase):
