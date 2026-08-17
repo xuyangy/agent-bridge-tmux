@@ -163,7 +163,10 @@ Three lines to hold firmly while you do:
 ## Replying
 
 Do the work, write only your response to a fresh scratch file, then run `reply`
-on it. No target argument exists. The helper replies to the validated `reply_to`, stamps
+on it. If the peer's body contains findings or requested changes, act on them
+before you reply, and say in your reply what you changed and what you rejected
+and why. An acknowledgement with no work behind it wastes a turn. No target
+argument exists. The helper replies to the validated `reply_to`, stamps
 your own cached pane and socket, carries the bridge token and goal phrase
 forward, increments the turn, and refuses to exceed `max`.
 
