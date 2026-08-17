@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
+import stat
 import tempfile
 import time
 import types
@@ -1115,6 +1117,117 @@ class TestDiagnosticMessages(TempRoot):
         self.assertIn("integrity check", message)
         self.assertLess(message.index("copy"), message.index("transport"),
                         "the likely cause must come before the unlikely one")
+
+
+class TestSecureDir(TempRoot):
+    """mkdir(mode=0o700, exist_ok=True) does not guarantee 0700. The mode applies
+    only at creation; an existing directory is adopted at whatever mode and owner
+    it already has. Harmless under a per-user temp dir as on macOS, an exposure
+    under a world-writable /tmp as on Linux."""
+
+    def test_it_creates_the_directory_private(self) -> None:
+        made = ab.secure_dir(self.root / "fresh")
+        self.assertTrue(made.is_dir())
+        self.assertEqual(stat.S_IMODE(made.stat().st_mode), 0o700)
+
+    def test_an_existing_private_directory_is_accepted(self) -> None:
+        existing = self.root / "ours"
+        existing.mkdir(mode=0o700)
+        self.assertEqual(ab.secure_dir(existing), existing)
+
+    def test_a_group_or_world_accessible_directory_is_refused(self) -> None:
+        # The regression itself: the old code returned this happily.
+        for mode in (0o777, 0o770, 0o750, 0o707, 0o701):
+            with self.subTest(mode=oct(mode)):
+                loose = self.root / f"loose{mode}"
+                loose.mkdir()
+                os.chmod(loose, mode)
+                with self.assertRaises(ab.BridgeError) as caught:
+                    ab.secure_dir(loose)
+                self.assertIn("0700", str(caught.exception))
+
+    def test_a_symlink_is_refused_rather_than_followed(self) -> None:
+        real = self.root / "elsewhere"
+        real.mkdir(mode=0o700)
+        link = self.root / "link"
+        link.symlink_to(real)
+        with self.assertRaises(ab.BridgeError) as caught:
+            ab.secure_dir(link)
+        self.assertIn("not a directory", str(caught.exception))
+
+    def test_a_file_in_the_way_is_refused(self) -> None:
+        blocker = self.root / "blocker"
+        blocker.write_text("")
+        with self.assertRaises(ab.BridgeError):
+            ab.secure_dir(blocker)
+
+    def test_a_foreign_owner_is_refused(self) -> None:
+        foreign = self.root / "theirs"
+        foreign.mkdir(mode=0o700)
+        original = os.getuid
+        setattr(os, "getuid", lambda: os.stat(foreign).st_uid + 1)
+        self.addCleanup(setattr, os, "getuid", original)
+        with self.assertRaises(ab.BridgeError) as caught:
+            ab.secure_dir(foreign)
+        self.assertIn("owned by uid", str(caught.exception))
+
+    def test_it_refuses_rather_than_repairing(self) -> None:
+        # Chmod-ing a directory we do not own would either fail or, worse, succeed
+        # on one we should not have been using at all.
+        loose = self.root / "loose"
+        loose.mkdir()
+        os.chmod(loose, 0o777)
+        with self.assertRaises(ab.BridgeError):
+            ab.secure_dir(loose)
+        self.assertEqual(stat.S_IMODE(loose.stat().st_mode), 0o777, "must not chmod")
+
+
+class TestGlobalAbortLocation(unittest.TestCase):
+    """The global sentinel used to be a hardcoded /tmp path on every platform, so
+    on Linux any other uid could create it and stop every bridge this user ran."""
+
+    def test_it_defaults_inside_the_state_root(self) -> None:
+        original = ab.GLOBAL_ABORT_OVERRIDE
+        setattr(ab, "GLOBAL_ABORT_OVERRIDE", "")
+        self.addCleanup(setattr, ab, "GLOBAL_ABORT_OVERRIDE", original)
+        self.assertEqual(ab.global_abort_file().parent, ab.state_root())
+        self.assertNotEqual(ab.global_abort_file(), ab.LEGACY_GLOBAL_ABORT)
+
+    def test_the_env_override_still_wins(self) -> None:
+        original = ab.GLOBAL_ABORT_OVERRIDE
+        setattr(ab, "GLOBAL_ABORT_OVERRIDE", "/somewhere/else.stop")
+        self.addCleanup(setattr, ab, "GLOBAL_ABORT_OVERRIDE", original)
+        self.assertEqual(str(ab.global_abort_file()), "/somewhere/else.stop")
+
+    def test_the_state_root_is_per_user(self) -> None:
+        self.assertIn(str(os.getuid()), ab.state_root().name)
+
+
+class TestLegacyGlobalSentinel(ExchangeCase):
+    """Moving the sentinel must not quietly restart bridges a human stopped with
+    the old command minutes earlier."""
+
+    def test_the_old_global_sentinel_still_stops_a_send(self) -> None:
+        old = self.root / "old-global.stop"
+        old.touch()
+        self.a["legacy_global_abort_file"] = str(old)
+        with self.assertRaises(ab.BridgeError) as caught:
+            self.start("hello")
+        self.assertIn("abort signal", str(caught.exception))
+
+    def test_clear_abort_all_removes_it(self) -> None:
+        old = self.root / "old-global.stop"
+        old.touch()
+        self.a["legacy_global_abort_file"] = str(old)
+        ab.command_clear_abort(types.SimpleNamespace(all=True))
+        self.assertFalse(old.exists())
+
+    def test_clear_abort_without_all_leaves_it(self) -> None:
+        old = self.root / "old-global.stop"
+        old.touch()
+        self.a["legacy_global_abort_file"] = str(old)
+        ab.command_clear_abort(types.SimpleNamespace(all=False))
+        self.assertTrue(old.exists(), "a global stop is not cleared as a side effect")
 
 
 if __name__ == "__main__":

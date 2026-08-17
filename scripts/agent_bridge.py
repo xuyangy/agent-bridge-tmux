@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -116,7 +117,12 @@ DEFAULT_ACK_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_ACK_TIMEOUT", "900"))
 # only runs out on a pane whose agent stopped existing.
 STALE_STATE_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_STALE_TIMEOUT",
                                          str(DEFAULT_ACK_TIMEOUT)))
-GLOBAL_ABORT = Path(os.environ.get("AGENT_BRIDGE_ABORT", "/tmp/agent-bridge.stop"))
+# Where the global sentinel lives. Empty means "inside the state root", which is
+# per-user and mode-checked; the old hardcoded /tmp path is still honoured if it
+# exists, so a human who wrote it before this change is not ignored.
+GLOBAL_ABORT_OVERRIDE = os.environ.get("AGENT_BRIDGE_ABORT", "")
+LEGACY_GLOBAL_ABORT = Path("/tmp/agent-bridge.stop")
+LEGACY_STATE_ROOT = Path(tempfile.gettempdir()) / "agent-bridge"
 TAIL_LINES = 12
 
 
@@ -171,10 +177,66 @@ def pane_exists(pane: str) -> bool:
 # --- identity -----------------------------------------------------------------
 
 
+def secure_dir(path: Path) -> Path:
+    """Create a private directory, or verify an existing one is really ours.
+
+    mkdir(mode=0o700, exist_ok=True) looks like it guarantees 0700 and does not.
+    The mode applies only when the directory is created; an existing one is
+    adopted at whatever mode and whatever owner it already has, with no check.
+    Verified: a directory pre-created 0777 is still 0777 after that call.
+
+    That is harmless where the temp directory is per-user, as it is on macOS, and
+    is a real exposure on Linux, where gettempdir() is a world-writable /tmp that
+    any other uid can pre-populate. So create with exist_ok=False and inspect
+    anything that already exists: lstat, so a symlink fails the directory test
+    rather than being followed; our uid; and no group or other bits at all.
+
+    Refuse rather than repair. Chmod-ing a directory we do not own would either
+    fail or, worse, succeed on one we should not have been using.
+    """
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=False)
+        return path
+    except FileExistsError:
+        pass
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise BridgeError(f"bridge state path is not a directory: {path}")
+    if info.st_uid != os.getuid():
+        raise BridgeError(
+            f"bridge state directory {path} is owned by uid {info.st_uid}, not "
+            f"{os.getuid()}. Refusing to use it. Remove it, or point the bridge "
+            f"elsewhere with TMPDIR."
+        )
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise BridgeError(
+            f"bridge state directory {path} is mode "
+            f"{stat.S_IMODE(info.st_mode):04o}; it must be 0700, since it holds "
+            f"message bodies and bridge tokens. Fix it with: chmod 700 {path}"
+        )
+    return path
+
+
 def state_root() -> Path:
-    root = Path(tempfile.gettempdir()) / "agent-bridge"
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return root
+    """Per-user, so a shared /tmp cannot be squatted to lock us out.
+
+    The uid in the name is not the security boundary — secure_dir is. It exists
+    so two users on one host do not race for the same name and leave the loser
+    unable to run at all.
+    """
+    return secure_dir(Path(tempfile.gettempdir()) / f"agent-bridge-{os.getuid()}")
+
+
+def global_abort_file() -> Path:
+    """The one-command stop for every bridge, inside the checked state root.
+
+    It used to be a hardcoded /tmp/agent-bridge.stop on every platform. On Linux
+    that let any other uid create the file and stop every bridge this user was
+    running, which is a denial of service handed out for free.
+    """
+    if GLOBAL_ABORT_OVERRIDE:
+        return Path(GLOBAL_ABORT_OVERRIDE)
+    return state_root() / "global.stop"
 
 
 def canonical_socket(socket: str) -> str:
@@ -210,17 +272,28 @@ def legacy_paths(raw_socket: str, socket: str, pane: str) -> dict[str, str]:
     nothing reads. Silence is the wrong answer to that, so find the old files and
     let the callers fail closed on them.
 
-    Empty strings when there is nothing to find, which is the normal case — the
-    two spellings only differ when the socket path went through a symlink.
+    Two things have moved the set so far, so both are searched: canonicalising the
+    socket string, and moving the root from a shared <tmp>/agent-bridge to a
+    per-user <tmp>/agent-bridge-<uid>. The root move affects every existing
+    install rather than only symlinked sockets, so it is checked unconditionally.
+
+    Empty strings when there is nothing to find, which is the normal case.
     """
-    if raw_socket == socket:
-        return {"legacy_state_file": "", "legacy_abort_file": ""}
-    prefix = state_root() / f"{hashlib.sha256(raw_socket.encode()).hexdigest()[:16]}-{pane[1:]}"
-    found = {}
-    for key, suffix in (("legacy_state_file", ".state.json"),
-                        ("legacy_abort_file", ".abort")):
-        path = prefix.with_suffix(suffix)
-        found[key] = str(path) if path.exists() else ""
+    current = state_root()
+    roots = [current] if current == LEGACY_STATE_ROOT else [LEGACY_STATE_ROOT, current]
+    sockets = [socket] if raw_socket == socket else [raw_socket, socket]
+    found = {"legacy_state_file": "", "legacy_abort_file": ""}
+    for root in roots:
+        for spelling in sockets:
+            digest = hashlib.sha256(spelling.encode()).hexdigest()[:16]
+            prefix = root / f"{digest}-{pane[1:]}"
+            if root == current and spelling == socket:
+                continue  # that is where we live now, not a leftover
+            for key, suffix in (("legacy_state_file", ".state.json"),
+                                ("legacy_abort_file", ".abort")):
+                path = prefix.with_suffix(suffix)
+                if not found[key] and path.exists():
+                    found[key] = str(path)
     return found
 
 
@@ -278,15 +351,21 @@ def detect_identity() -> dict[str, str]:
         "state_file": str(prefix.with_suffix(".state.json")),
         "log_file": str(prefix.with_suffix(".log")),
         "abort_file": str(prefix.with_suffix(".abort")),
-        "global_abort_file": str(GLOBAL_ABORT),
+        "global_abort_file": str(global_abort_file()),
     }
     identity.update(legacy_paths(raw_socket, socket, pane))
+    # The pre-move global sentinel. Someone may have stopped every bridge with the
+    # old command minutes ago; moving the file is no reason to start them again.
+    identity["legacy_global_abort_file"] = (
+        str(LEGACY_GLOBAL_ABORT)
+        if LEGACY_GLOBAL_ABORT != global_abort_file() and LEGACY_GLOBAL_ABORT.exists()
+        else "")
     # Two buttons, deliberately not one. With several bridges running at once —
     # panes 1↔2 and 3↔4, say — the command printed every turn must stop only the
     # bridge the human is watching. `abort_command` is therefore the per-pane
     # sentinel; the global one is offered separately, for stopping everything.
     identity["abort_command"] = f"touch {shlex.quote(str(prefix.with_suffix('.abort')))}"
-    identity["abort_all_command"] = f"touch {shlex.quote(str(GLOBAL_ABORT))}"
+    identity["abort_all_command"] = f"touch {shlex.quote(str(global_abort_file()))}"
 
     if identity_file.exists():
         try:
@@ -310,7 +389,7 @@ def identity_payload(identity: dict[str, str]) -> dict[str, Any]:
     payload: dict[str, Any] = {key: identity[key] for key in keys}
     # Only worth reporting when there is something there; an empty pair of keys on
     # every single command would be noise the agent has to read past each turn.
-    for key in ("legacy_state_file", "legacy_abort_file"):
+    for key in ("legacy_state_file", "legacy_abort_file", "legacy_global_abort_file"):
         if identity.get(key):
             payload[key] = identity[key]
     return payload
@@ -381,7 +460,8 @@ def check_abort(identity: dict[str, str]) -> None:
     command they can remember, one per pane for stopping just this exchange."""
     # legacy_abort_file is the same button under its pre-canonicalisation name.
     # A human handed the old abort command must not find it silently ignored.
-    for key in ("global_abort_file", "abort_file", "legacy_abort_file"):
+    for key in ("global_abort_file", "abort_file", "legacy_abort_file",
+                "legacy_global_abort_file"):
         raw = identity.get(key) or ""
         if raw and Path(raw).exists():
             raise BridgeError(f"human abort signal detected: {raw}")
@@ -1206,7 +1286,7 @@ def clear_sentinels(identity: dict[str, str], *, include_global: bool) -> list[s
     """
     keys = ["abort_file", "legacy_abort_file"]
     if include_global:
-        keys.append("global_abort_file")
+        keys.extend(["global_abort_file", "legacy_global_abort_file"])
     removed = []
     for key in keys:
         raw = identity.get(key) or ""
