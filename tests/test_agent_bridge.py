@@ -1325,7 +1325,7 @@ class AncestryCase(unittest.TestCase):
     about its one real input rather than patching os.getpid out from under it.
     """
 
-    PANES = {"%0": 43188, "%9": 81541, "%7": 5000}
+    PANES = {"%0": 43188, "%9": 81541, "%7": 5000, "%11": 50899}
 
     def setUp(self) -> None:
         self.focused = "%0"
@@ -1339,7 +1339,14 @@ class AncestryCase(unittest.TestCase):
                 rows = "".join(f"{p} {pid}\n" for p, pid in self.PANES.items())
                 return types.SimpleNamespace(returncode=0, stdout=rows, stderr="")
             if args[0] == "display-message":
-                return types.SimpleNamespace(returncode=0, stdout=self.focused + "\n",
+                # Answer by format string. detect_identity asks for the socket
+                # through this same call, and handing it a pane id would make
+                # every path key off the wrong thing for an invisible reason.
+                answers = {"#{pane_id}": self.focused, "#{socket_path}": SOCKET}
+                fmt = args[-1]
+                if fmt not in answers:
+                    raise AssertionError(f"unstubbed tmux format: {fmt}")
+                return types.SimpleNamespace(returncode=0, stdout=answers[fmt] + "\n",
                                              stderr="")
             raise AssertionError(f"unexpected tmux call: {args}")
 
@@ -1459,6 +1466,59 @@ class TestGuessedPaneIsVerified(AncestryCase):
         pane, said = self.resolve(None)
         self.assertEqual(pane, "%0")
         self.assertIn("warning", said)
+
+
+class TestResolvedPaneKeysTheFiles(AncestryCase):
+    """The one sentence this whole mechanism exists to make true.
+
+    Resolving the right pane is worth nothing if the files are then keyed to the
+    wrong one, and that step was asserted nowhere: a regression that resolved %9
+    perfectly and named every path after the focused %11 would have left the rest
+    of the suite green. The three collisions this guards against — the real
+    occupant locked out of a bridge, our log written under theirs, their sentinel
+    in the abort command a human is handed — are all properties of these paths,
+    not of the pane id in isolation.
+
+    Both directions are asserted. The failure mode produces exactly one of "names
+    the resolved pane" and "does not name the focused pane" without the other.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        original = ab.state_root
+        setattr(ab, "state_root", lambda: root)
+        self.addCleanup(setattr, ab, "state_root", original)
+
+    def resolve_identity(self) -> dict[str, str]:
+        self.focused = "%11"        # a stranger's pane holds focus
+        self.chain(87768, 81541)    # ancestry proves we are in %9
+        with _env(TMUX="/tmp/sock,1,0", TMUX_PANE=None):
+            with contextlib.redirect_stderr(io.StringIO()):
+                return ab.detect_identity()
+
+    def test_every_per_pane_file_is_named_for_the_resolved_pane(self) -> None:
+        identity = self.resolve_identity()
+        self.assertEqual(identity["self_pane"], "%9")
+        for key, suffix in (("state_file", ".state.json"),
+                            ("log_file", ".log"),
+                            ("abort_file", ".abort"),
+                            ("identity_file", ".identity.json")):
+            with self.subTest(path=key):
+                name = Path(identity[key]).name
+                self.assertTrue(
+                    name.endswith(f"-9{suffix}"),
+                    f"{key} is {name}; must be keyed to %9, the pane we are in")
+                self.assertFalse(
+                    name.endswith(f"-11{suffix}"),
+                    f"{key} is {name}; must not be keyed to the focused %11")
+
+    def test_the_abort_command_stops_our_bridge_and_not_a_strangers(self) -> None:
+        """The string a human is handed, and the worst of the three collisions."""
+        identity = self.resolve_identity()
+        self.assertIn("-9.abort", identity["abort_command"])
+        self.assertNotIn("-11.abort", identity["abort_command"])
 
 
 class TestParentPids(unittest.TestCase):
