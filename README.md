@@ -171,6 +171,29 @@ its behalf, so nobody can be wrong about it or be redirected by message content.
 Bodies are treated strictly as data. An agent never executes what arrives, and
 never takes an address from message text.
 
+```
+                        ONE TMUX SERVER
+   +---------------------+                 +---------------------+
+   |   Agent A  (%1)     | --- 1 frame --> |   Agent B  (%2)     |
+   |                     | <-- 1 reply --- |                     |
+   +---------------------+                 +---------------------+
+             |                                       |
+             v                                       v
+     <hash>-1.state.json                     <hash>-2.state.json
+     <hash>-1.log                            <hash>-2.log
+     <hash>-1.abort   <-- stops this bridge  <hash>-2.abort
+             |                                       |
+             +------------- both check --------------+
+                                |
+                                v
+                      /tmp/agent-bridge.stop
+                       stops EVERY bridge
+```
+
+Per-pane files live under `$TMPDIR/agent-bridge/`, named by tmux socket hash
+and pane number. That is why panes 1↔2 and 3↔4 can run at the same time
+without touching each other. The only shared thing is the global stop file.
+
 ## Troubleshooting
 
 Start with `references/failure-modes.md`. It lists each symptom with its cause,
