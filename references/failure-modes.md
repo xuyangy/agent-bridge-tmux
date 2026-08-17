@@ -41,11 +41,22 @@ When it is missing, the helper resolves the pane in this order:
 
 ### The hole that is still open
 
-Step 2 is reached when ancestry cannot tell, and the case that does it is a
-**daemonised or `setsid` agent** whose process tree was reparented away from the
-pane. Its chain runs to init and meets no pane pid, so it is indistinguishable
-from a process in no pane at all. If such an agent runs in a pane that does not
-have focus, every per-pane file is keyed to the wrong pane, silently:
+Step 2 is reached when ancestry cannot tell, and the case that does it is an
+**orphaned agent** — one whose parent exited, leaving init to adopt it, as a
+classic double-fork daemon does. Its chain runs to init and meets no pane pid,
+so it is indistinguishable from a process in no pane at all.
+
+Detaching from the terminal is *not* what does this, and the two are easy to
+confuse. Measured against a live server: a child that called `setsid()` had its
+own session and no controlling terminal, and still resolved to the correct pane,
+because setsid does not reparent anything. Only the double-fork — where the
+intermediate parent exits — produced a chain of length one and no answer. If you
+are wondering whether some agent launcher defeats this, the question to ask is
+whether the process gets orphaned, not whether it detaches.
+
+If such an agent runs in a pane that does not have focus, every per-pane file is
+keyed to the wrong pane, silently. Observed, not reasoned: a double-forked probe
+descended from `%9`, with focus sitting on `%11`, resolved to `%11`.
 
 - **State** — the real occupant of the focused pane is told `this pane already
   has an active bridge` and cannot start one.
