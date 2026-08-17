@@ -177,6 +177,28 @@ def state_root() -> Path:
     return root
 
 
+def canonical_socket(socket: str) -> str:
+    """Resolve a socket path through symlinks so two panes agree on one spelling.
+
+    The receive-side server check is a string comparison, and the primary source
+    (`#{socket_path}`) is server-side, so both panes normally get an identical
+    value and this changes nothing. It matters on the fallback path — tmux older
+    than 2.2, where the value comes from each client's own `$TMUX` — because on
+    macOS `/tmp` is a symlink to `/private/tmp`, so two clients attached by
+    different spellings of the same socket would look like different servers and
+    every frame would be refused with "peer is on a different tmux server".
+
+    The pid fallback is not a path; realpath would turn it into a bogus absolute
+    one, so leave anything that is not an existing path alone.
+    """
+    if not socket.startswith("/"):
+        return socket
+    try:
+        return os.path.realpath(socket)
+    except OSError:
+        return socket
+
+
 def detect_identity() -> dict[str, str]:
     """Resolve this pane's own address, once, and cache it.
 
@@ -203,6 +225,7 @@ def detect_identity() -> dict[str, str]:
         socket = tmux_socket() or tmux_value("#{pid}")
     if not socket:
         raise BridgeError("could not determine tmux server socket identity")
+    socket = canonical_socket(socket)
 
     prefix = state_root() / f"{hashlib.sha256(socket.encode()).hexdigest()[:16]}-{pane[1:]}"
     identity_file = prefix.with_suffix(".identity.json")
@@ -227,7 +250,11 @@ def detect_identity() -> dict[str, str]:
             cached = json.loads(identity_file.read_text())
         except (OSError, json.JSONDecodeError):
             cached = None
-        if cached and (cached.get("self_pane") != pane or cached.get("self_socket") != socket):
+        # Compare the cached socket canonically too: a file written before
+        # canonicalisation holds the uncanonical spelling of the same socket, and
+        # that is agreement, not a conflict.
+        if cached and (cached.get("self_pane") != pane
+                       or canonical_socket(str(cached.get("self_socket", ""))) != socket):
             raise BridgeError("cached tmux identity conflicts with current pane/server")
     else:
         atomic_json(identity_file, identity)
@@ -459,7 +486,22 @@ def render_frame(meta: dict[str, str], body: str) -> str:
         values["enc"] = encoding
     fields = [f"{key}={shlex.quote(value)}" for key, value in values.items()]
     fields.append(f"sum={frame_digest(values, encoded_body)}")
-    return f"{FRAME_START} {' '.join(fields)}>>> {encoded_body} {FRAME_END}"
+    header = " ".join(fields)
+    # The header ends at the first ">", because that is how the parser finds the
+    # body. shlex.quote does not help: it wraps an odd value in quotes but leaves
+    # the ">" inside them. A header value carrying one would produce a frame that
+    # every receiver rejects as malformed, with nothing pointing at the cause.
+    # server= is the field that can realistically hold one, since it is a
+    # filesystem socket path. Refuse to build the frame instead.
+    if ">" in header or "\n" in header:
+        offenders = sorted(key for key, value in values.items()
+                           if ">" in value or "\n" in value)
+        raise BridgeError(
+            f"cannot frame this message: header field(s) {', '.join(offenders)} "
+            f"contain '>' or a newline, which would truncate the frame. Move the "
+            f"tmux socket to a path without '>' and start a new bridge."
+        )
+    return f"{FRAME_START} {header}>>> {encoded_body} {FRAME_END}"
 
 
 def parse_frame(raw: str) -> tuple[dict[str, str], str]:
@@ -721,7 +763,13 @@ def submitted(target: str) -> bool:
     """
     result = capture_pane_text(target, history=True, check=False)
     if result.returncode != 0:
-        return True
+        # A capture can fail because the pane is genuinely gone — it exited, so
+        # whatever was in its input box is moot — or because tmux hiccupped. Only
+        # the first is evidence of delivery. Reading the second as "submitted"
+        # turns a transient error into a false success, the exact failure this
+        # function exists to prevent, so ask the server whether the pane is still
+        # there and stay pessimistic when it is.
+        return not pane_exists(target)
     clean = ANSI_RE.sub("", result.stdout)
     lines = [line.rstrip() for line in clean.splitlines() if line.strip()]
     if BUSY_RE.search("\n".join(lines[-TAIL_LINES:])):
@@ -785,14 +833,26 @@ def first_line(body: str) -> str:
 
 
 def send_or_release(identity: dict[str, str], target: str,
-                    meta: dict[str, str], body: str) -> float:
-    """Send, and on failure leave the pane usable rather than wedged.
+                    meta: dict[str, str], body: str,
+                    goal_b64: str | None = None) -> float:
+    """Record the attempt, send it, and on failure leave the pane usable.
 
-    A delivery that dies partway used to write no state at all, so a previous
-    "pending" record stayed behind and every later start was refused with "this
-    pane already has an active bridge". Recording the failure is what lets the
-    human simply try again.
+    The record is written *before* delivery, not after. A frame reaches the peer
+    partway through send_message, so a process killed between the peer receiving
+    it and the caller saving state used to leave the sender with no record of a
+    conversation that had already begun: the peer's reply would then be refused
+    as an unsolicited frame. Writing first makes the crash window harmless — the
+    worst case is a pending record for a frame that never landed, and that
+    expires on its own.
+
+    On failure the record is downgraded to terminated. A delivery that dies
+    partway once wrote no state at all, so a stale "pending" survived and every
+    later start was refused with "this pane already has an active bridge".
     """
+    save_state(identity, {"status": "pending", "bridge": meta["bridge"],
+                          "turn": int(meta["turn"]), "max": int(meta["max"]),
+                          "target": target, "goal_b64": goal_b64,
+                          "ack_deadline": time.time() + DEFAULT_ACK_TIMEOUT})
     try:
         return send_message(identity, target, meta, body)
     except BridgeError as exc:
@@ -871,7 +931,7 @@ def command_start(args: argparse.Namespace) -> dict[str, Any]:
     if reason:
         meta["stop"] = reason
 
-    deadline = send_or_release(identity, args.target, meta, body)
+    deadline = send_or_release(identity, args.target, meta, body, meta.get("goal_b64"))
     if reason:
         save_state(identity, {"status": "terminated", "reason": reason,
                               "bridge": bridge, "turn": 1})
@@ -995,7 +1055,9 @@ def command_reply(args: argparse.Namespace) -> dict[str, Any]:
         meta["stop"] = reason
 
     target = str(state["target"])
-    deadline = send_or_release(identity, target, meta, body)
+    goal_b64 = state.get("goal_b64")
+    deadline = send_or_release(identity, target, meta, body,
+                               None if goal_b64 is None else str(goal_b64))
 
     if reason:
         save_state(identity, {"status": "terminated", "reason": reason,

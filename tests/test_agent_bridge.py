@@ -854,5 +854,135 @@ class TestFocusProbe(unittest.TestCase):
         self.assertFalse(self.notified_for("1,1,3"))
 
 
+class TestStateIsRecordedBeforeDelivery(ExchangeCase):
+    """The frame reaches the peer inside send_message, so the sender's record of
+    the exchange must already exist by then. Saving afterwards leaves a window
+    where a killed process forgets a conversation the peer has already begun,
+    and the peer's reply is then refused as unsolicited."""
+
+    def state_seen_during_send(self, run) -> dict[str, Any]:
+        seen: dict[str, Any] = {}
+        wire = self.wire
+
+        def spy(identity, target, meta, body):
+            seen.update(ab.load_state(identity) or {"missing": True})
+            return wire(identity, target, meta, body)
+
+        setattr(ab, "send_message", spy)
+        self.addCleanup(setattr, ab, "send_message", self.original_send)
+        run()
+        return seen
+
+    def test_start_records_pending_before_it_sends(self) -> None:
+        state = self.state_seen_during_send(lambda: self.start("hello", max_turns=4))
+        self.assertEqual(state.get("status"), "pending")
+        self.assertEqual(state.get("turn"), 1)
+        self.assertEqual(state.get("max"), 4)
+        self.assertEqual(state.get("target"), self.b["self_pane"])
+
+    def test_the_pre_send_record_carries_the_goal_phrase(self) -> None:
+        # A record written before delivery still has to be the real one: if it
+        # dropped the goal phrase, a crash mid-send would silently disarm the
+        # early-stop condition for the rest of the exchange.
+        state = self.state_seen_during_send(
+            lambda: self.start("hello", max_turns=4, goal="WE ARE DONE"))
+        self.assertEqual(state.get("goal_b64"), ab.b64url_encode("WE ARE DONE"))
+
+    def test_reply_records_pending_before_it_sends(self) -> None:
+        opening = self.start("hello", max_turns=4)
+        self.assertEqual(opening["action"], "wait")
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        state = self.state_seen_during_send(lambda: self.reply("answer", "b"))
+        self.assertEqual(state.get("status"), "pending")
+        self.assertEqual(state.get("turn"), 2)
+        self.assertEqual(state.get("target"), self.a["self_pane"])
+
+    def test_a_failed_delivery_still_releases_the_pane(self) -> None:
+        def boom(*_a, **_k):
+            raise ab.BridgeError("target never went idle")
+
+        setattr(ab, "send_message", boom)
+        self.addCleanup(setattr, ab, "send_message", self.original_send)
+        with self.assertRaises(ab.BridgeError):
+            self.start("hello")
+        state = ab.load_state(self.a)
+        assert state is not None
+        self.assertEqual(state["status"], "terminated")
+        self.assertIn("delivery failed", state["reason"])
+
+
+class TestHeaderCannotTruncateTheFrame(TempRoot):
+    """The header ends at the first ">", so a ">" inside a header value would
+    build a frame that every receiver rejects as malformed, with nothing
+    pointing at the cause. server= is a socket path, so this is reachable."""
+
+    def meta(self, **overrides: str) -> dict[str, str]:
+        base = {"turn": "1", "max": "4", "reply_to": "%2", "server": SOCKET,
+                "bridge": "a" * 32}
+        base.update(overrides)
+        return base
+
+    def test_a_socket_path_with_an_angle_bracket_is_refused(self) -> None:
+        with self.assertRaises(ab.BridgeError) as caught:
+            ab.render_frame(self.meta(server="/tmp/tmux->1000/default"), "body")
+        self.assertIn("server", str(caught.exception))
+
+    def test_a_newline_in_a_header_value_is_refused(self) -> None:
+        with self.assertRaises(ab.BridgeError):
+            ab.render_frame(self.meta(server="/tmp/one\ntwo"), "body")
+
+    def test_an_ordinary_socket_path_still_frames(self) -> None:
+        meta, decoded = ab.parse_frame(ab.render_frame(self.meta(), "body"))
+        self.assertEqual(meta["server"], SOCKET)
+        self.assertEqual(decoded, "body")
+
+
+class TestSubmittedOnCaptureFailure(unittest.TestCase):
+    """A failed capture is not evidence of delivery unless the pane is gone."""
+
+    def submitted_when(self, *, pane_alive: bool) -> bool:
+        def fake(args, **_k):
+            if args and args[0] == "display-message":
+                return types.SimpleNamespace(
+                    returncode=0 if pane_alive else 1,
+                    stdout="%2\n" if pane_alive else "")
+            return types.SimpleNamespace(returncode=1, stdout="")
+
+        original = ab.run_tmux
+        setattr(ab, "run_tmux", fake)
+        self.addCleanup(setattr, ab, "run_tmux", original)
+        return ab.submitted("%2")
+
+    def test_a_transient_capture_error_is_not_a_successful_submit(self) -> None:
+        self.assertFalse(self.submitted_when(pane_alive=True))
+
+    def test_a_vanished_pane_still_counts_as_consumed(self) -> None:
+        self.assertTrue(self.submitted_when(pane_alive=False))
+
+
+class TestCanonicalSocket(TempRoot):
+    """Two spellings of one socket must not look like two servers."""
+
+    def test_a_symlinked_path_resolves_to_its_target(self) -> None:
+        real = self.root / "real"
+        real.mkdir()
+        (real / "default").write_text("")
+        link = self.root / "link"
+        link.symlink_to(real)
+        self.assertEqual(ab.canonical_socket(str(link / "default")),
+                         ab.canonical_socket(str(real / "default")))
+
+    def test_a_plain_path_is_unchanged(self) -> None:
+        real = self.root / "default"
+        real.write_text("")
+        self.assertEqual(ab.canonical_socket(str(real)), str(real.resolve()))
+
+    def test_the_pid_fallback_is_left_alone(self) -> None:
+        # The last-resort identity is #{pid}, not a path. realpath would turn it
+        # into a bogus absolute path relative to the cwd.
+        self.assertEqual(ab.canonical_socket("48213"), "48213")
+
+
 if __name__ == "__main__":
     unittest.main()
