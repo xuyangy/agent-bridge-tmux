@@ -1111,6 +1111,12 @@ def main() -> int:
         # traceback it might try to interpret as protocol output.
         print(f"agent-bridge: file error: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # Ctrl-C during a readiness wait or a submit backoff. Exit the way a
+        # shell expects (130) with one line, not a traceback the calling agent
+        # might read as protocol output.
+        print("agent-bridge: interrupted", file=sys.stderr)
+        return 130
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

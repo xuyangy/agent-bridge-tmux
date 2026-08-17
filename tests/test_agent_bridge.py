@@ -18,11 +18,12 @@ import time
 import types
 import unittest
 from pathlib import Path
+from typing import Any
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "agent_bridge.py"
 
 
-def load_module():
+def load_module() -> types.ModuleType:
     spec = importlib.util.spec_from_file_location("agent_bridge", SCRIPT)
     assert spec and spec.loader, f"cannot load {SCRIPT}"
     module = importlib.util.module_from_spec(spec)
@@ -182,7 +183,7 @@ class Wire:
     def __init__(self) -> None:
         self.frames: list[str] = []
 
-    def __call__(self, _identity, _target, meta, body):
+    def __call__(self, _identity, _target, meta, body) -> float:
         self.frames.append(ab.render_frame(meta, body))
         return time.time() + ab.DEFAULT_ACK_TIMEOUT
 
@@ -219,17 +220,17 @@ class ExchangeCase(TempRoot):
         path.write_text(text)
         return str(path)
 
-    def start(self, body: str, max_turns: int = 4, goal: str | None = None):
+    def start(self, body: str, max_turns: int = 4, goal: str | None = None) -> dict[str, Any]:
         return ab.command_start(types.SimpleNamespace(
             target=self.b["self_pane"], max_turns=max_turns,
             body_file=self.write("a-out.txt", body), goal_phrase=goal))
 
-    def receive(self, frame: str, tag: str):
+    def receive(self, frame: str, tag: str) -> dict[str, Any]:
         return ab.command_receive(types.SimpleNamespace(
             frame_file=self.write(f"{tag}-in.txt", frame),
             body_out=str(self.root / f"{tag}-body.txt")))
 
-    def reply(self, body: str, tag: str):
+    def reply(self, body: str, tag: str) -> dict[str, Any]:
         return ab.command_reply(types.SimpleNamespace(
             body_file=self.write(f"{tag}-out.txt", body)))
 
@@ -351,7 +352,7 @@ class TestExchange(ExchangeCase):
 
 
 class TestReceiveRejects(ExchangeCase):
-    def bootstrap_frame(self, **overrides) -> str:
+    def bootstrap_frame(self, **overrides: str) -> str:
         meta = {"turn": "1", "max": "4", "reply_to": "%9", "server": SOCKET,
                 "bridge": "c" * 32, "bootstrap": "agent-bridge"}
         meta.update(overrides)
@@ -535,13 +536,13 @@ class TestConcurrentBridges(TempRoot):
         path.write_text(text)
         return str(path)
 
-    def start(self, source: int, target: int, body: str, max_turns: int = 4):
+    def start(self, source: int, target: int, body: str, max_turns: int = 4) -> dict[str, Any]:
         self.as_pane(source)
         return ab.command_start(types.SimpleNamespace(
             target=self.panes[target]["self_pane"], max_turns=max_turns,
             body_file=self.write(f"{source}-out.txt", body), goal_phrase=None))
 
-    def receive(self, pane: int, frame: str):
+    def receive(self, pane: int, frame: str) -> dict[str, Any]:
         self.as_pane(pane)
         return ab.command_receive(types.SimpleNamespace(
             frame_file=self.write(f"{pane}-in.txt", frame),
