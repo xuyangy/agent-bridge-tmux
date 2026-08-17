@@ -1286,6 +1286,48 @@ def send_or_release(identity: dict[str, str], target: str,
         raise
 
 
+def open_log(path: Path) -> Any:
+    """Append to the log, created 0600, and tightened if it is not.
+
+    The `.json` files are chmod 0600 explicitly; the log was only ever whatever
+    umask made it, which is 0644 in practice. Inside a verified-private root that
+    is not an exposure, but the point of secure_dir was to stop depending on the
+    parent for the permissions of files we create ourselves, and the log now
+    carries frame metadata and refusal reasons rather than just our own sends.
+
+    Repairing here is not a contradiction of secure_dir's refuse-do-not-repair
+    rule. That refused a DIRECTORY whose owner might not be us, where a wrong
+    mode could mean someone else's. This file lives inside a root already proved
+    to be ours, so a loose mode can only be our own earlier umask. fchmod on the
+    open descriptor, so there is no window between the check and the fix.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        if stat.S_IMODE(os.fstat(fd).st_mode) & 0o077:
+            os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    return os.fdopen(fd, "a", encoding="utf-8")
+
+
+def log_line_present(path: Path, marker: str) -> bool:
+    """Is there a log line whose own text begins with `marker`?
+
+    Deliberately not a substring search over the whole file. Every line carries a
+    timestamp first, then its text, and the text of a send includes the first
+    line of a body we wrote — which can contain anything at all, including
+    something shaped exactly like this marker. A plain `in` would then read our
+    own quoted prose as proof that a note had already been written, and suppress
+    a real one. Compare after the timestamp instead.
+    """
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(line.split(" ", 1)[-1].startswith(marker)
+               for line in contents.splitlines())
+
+
 def log_identity_basis(identity: dict[str, str]) -> None:
     """Record how this pane's id was decided, in the log, once.
 
@@ -1324,22 +1366,104 @@ def log_identity_basis(identity: dict[str, str]) -> None:
                   "files may belong to another pane. Set TMUX_PANE to settle it")
 
     path = Path(identity["log_file"])
+    if log_line_present(path, marker):
+        return
+    # Leads with "identity", where every other line leads with "target=" or
+    # "inbound", so no two shapes can be mistaken for one another.
+    line = (f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {marker}{where} "
+            f"detail={json.dumps(detail, ensure_ascii=False)}")
     try:
-        if path.exists() and marker in path.read_text(encoding="utf-8"):
-            return
-    except OSError:
-        # An unreadable log is not a reason to skip the note; a duplicate line is
-        # a far smaller problem than a missing explanation.
-        pass
-    # Leads with "identity", where every other line leads with "target=", so
-    # neither shape can be mistaken for the other.
-    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {marker}{where} detail={json.dumps(detail)}"
-    try:
-        with path.open("a", encoding="utf-8") as handle:
+        with open_log(path) as handle:
             handle.write(line + "\n")
     except OSError as exc:
         print(f"agent-bridge: could not record identity basis in the log: {exc}",
               file=sys.stderr)
+
+
+DETAIL_LIMIT = 200
+
+
+def short_detail(detail: str) -> str:
+    """Trim a refusal reason to something a log can hold.
+
+    These messages are written for an agent reading stderr, so the good ones are
+    a paragraph: the checksum failure alone is around seven hundred characters of
+    diagnosis and remedy. Verbatim, one refusal dwarfs every other line in the
+    file and the log stops being scannable, which defeats the point of having it.
+
+    Found by running a real receive rather than by testing: every test here used
+    a short synthetic reason, so nothing caught it. The diagnosis is at the front
+    of these messages and the remedy at the back, so a head-cut keeps the part a
+    log needs. The full text still goes to stderr, where it was always aimed.
+    """
+    if len(detail) <= DETAIL_LIMIT:
+        return detail
+    cut = detail[:DETAIL_LIMIT]
+    # Prefer a word boundary, but only a nearby one; a long unbroken token such
+    # as a path must not be trimmed back to nothing.
+    space = cut.rfind(" ")
+    if space > DETAIL_LIMIT - 40:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:") + "…"
+
+
+def log_inbound(identity: dict[str, str], meta: dict[str, str],
+                *, outcome: str, detail: str) -> None:
+    """Record that a frame arrived and what was decided about it.
+
+    Sends were logged and arrivals were not, so the log could not answer the
+    question people actually ask when a bridge stalls: did the frame arrive and
+    get refused, or never arrive at all? Those have completely different fixes
+    and the log pointed at neither. A refused frame is also the most diagnostic
+    event this system produces, and it was the only one thrown away.
+
+    NO BODY CONTENT, ever, accepted or refused. A refused body is unvalidated
+    input and must not land verbatim in a durable file. An accepted body is
+    integrity-checked but still peer-authored, and it is already written to the
+    body-out file, so putting it here would duplicate content that is available
+    anyway in exchange for making the log a place where a peer can write. "No
+    inbound body in the log" is a simpler invariant to keep than "escaped inbound
+    body is fine", and the log's job here is whether a frame arrived, not what it
+    said.
+
+    Header fields are safe by construction rather than by escaping: reply_to and
+    bridge are regex-checked in parse_frame before we ever see them, and turn and
+    max are emitted only if they are digits. Anything not constrained is omitted
+    rather than quoted, so nothing peer-controlled reaches the file unshaped.
+    Only a prefix of the token: enough to line two logs up against each other,
+    not enough to be the token.
+
+    One rule decides how the fields are named, and it is the same lesson as
+    pane_basis: a log that records a disputed value indistinguishably from an
+    established one is where a later reader learns something wrong with
+    confidence. On an accepted line every field survived every check that makes
+    it true, so it is stated plainly. On any other line NOTHING was established —
+    a refusal for a stale turn disputes the turn, a token mismatch disputes the
+    token, a bad reply_to disputes the peer — so every field carries `_claimed`.
+    Marking only some would imply the rest were established, which is worse than
+    marking none.
+
+    Never raises. A failed write must not change what receive decided.
+    """
+    fields = ["inbound"]
+    sure = outcome == "accepted"
+    name = (lambda key: key) if sure else (lambda key: f"{key}_claimed")
+    turn, maximum = meta.get("turn", ""), meta.get("max", "")
+    if turn.isdigit() and maximum.isdigit():
+        fields.append(f"{name('turn')}={turn}/{maximum}")
+    if meta.get("reply_to"):
+        fields.append(f"{name('peer')}={meta['reply_to']}")
+    if meta.get("bridge"):
+        fields.append(f"{name('bridge')}={meta['bridge'][:8]}")
+    fields.append(f"outcome={outcome}")
+    if detail:
+        fields.append(f"detail={json.dumps(short_detail(detail), ensure_ascii=False)}")
+
+    try:
+        with open_log(Path(identity["log_file"])) as handle:
+            handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {' '.join(fields)}\n")
+    except (OSError, KeyError) as exc:
+        print(f"agent-bridge: could not log the inbound frame: {exc}", file=sys.stderr)
 
 
 def send_message(identity: dict[str, str], target: str, meta: dict[str, str], body: str) -> float:
@@ -1355,7 +1479,7 @@ def send_message(identity: dict[str, str], target: str, meta: dict[str, str], bo
     log_identity_basis(identity)
     log_line = (f"target={target} turn={meta['turn']}/{meta['max']} "
                 f"first_line={json.dumps(first_line(body), ensure_ascii=False)}")
-    with Path(identity["log_file"]).open("a", encoding="utf-8") as handle:
+    with open_log(Path(identity["log_file"])) as handle:
         handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {log_line}\n")
     print(f"OUTBOUND {log_line}")
 
@@ -1446,10 +1570,44 @@ def command_start(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_receive(args: argparse.Namespace) -> dict[str, Any]:
-    identity = detect_identity()
-    check_abort(identity)
-    meta, body = parse_frame(read_text_file(args.frame_file, "frame file"))
+    """Validate an inbound frame, and record either way that it arrived.
 
+    The logging wraps everything, including the paths that fire before the header
+    can be trusted at all — a malformed frame, a failed checksum, an aborted
+    bridge. Those are exactly the cases where the log is the only evidence that
+    anything arrived, since a frame that does not parse leaves the caller with an
+    error and the disk with nothing.
+
+    `meta` stays empty until parse_frame succeeds, so a refusal before that point
+    is logged as a bare arrival rather than with invented header fields.
+    """
+    identity = detect_identity()
+    meta: dict[str, str] = {}
+    try:
+        check_abort(identity)
+    except BridgeError as exc:
+        # Its own word, not "refused". Nothing was wrong with this frame; a human
+        # switched the bridge off, often minutes earlier and somewhere else, and
+        # the peer will see only silence and then a timeout. Neither side's log
+        # explained that before. The sentinel path rides in the detail, because
+        # "which button did it" is the next question a reader has.
+        log_inbound(identity, meta, outcome="dropped", detail=str(exc))
+        raise
+    try:
+        parsed, body = parse_frame(read_text_file(args.frame_file, "frame file"))
+        meta = parsed
+        result = validate_inbound(args, identity, meta, body)
+    except BridgeError as exc:
+        log_inbound(identity, meta, outcome="refused", detail=str(exc))
+        raise
+    log_inbound(identity, meta, outcome="accepted",
+                detail=f"action={result['action']}"
+                       + (f" stop={result['reason']}" if result["reason"] else ""))
+    return result
+
+
+def validate_inbound(args: argparse.Namespace, identity: dict[str, str],
+                     meta: dict[str, str], body: str) -> dict[str, Any]:
     if meta["server"] != identity["self_socket"]:
         raise BridgeError("peer is on a different tmux server, not supported")
     if meta["reply_to"] == identity["self_pane"]:

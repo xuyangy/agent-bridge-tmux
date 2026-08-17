@@ -1644,6 +1644,223 @@ class TestSendMessageRecordsTheBasis(TempRoot):
         self.assertIn("target=%0", lines[0])
 
 
+class TestInboundIsLogged(ExchangeCase):
+    """"Did it arrive and get refused, or never arrive?" — answerable at last.
+
+    Sends were logged and arrivals were not, so those two had identical evidence:
+    none. They point at completely different fixes.
+    """
+
+    SECRET = "SENSITIVE-BODY-TEXT-THAT-MUST-NOT-BE-LOGGED"
+
+    def inbound_lines(self, identity: dict[str, str]) -> list[str]:
+        path = Path(identity["log_file"])
+        if not path.exists():
+            return []
+        return [ln for ln in path.read_text(encoding="utf-8").splitlines()
+                if " inbound " in ln]
+
+    def bootstrap(self, body: str = "hello", **over: str) -> str:
+        meta = {"turn": "1", "max": "4", "reply_to": "%1", "server": SOCKET,
+                "bridge": "c" * 32, "bootstrap": "agent-bridge"}
+        meta.update(over)
+        return ab.render_frame(meta, body)
+
+    def test_an_accepted_frame_is_recorded_with_its_outcome(self) -> None:
+        self.as_agent(self.b)
+        self.receive(self.bootstrap(), "b")
+        line, = self.inbound_lines(self.b)
+        self.assertIn("outcome=accepted", line)
+        self.assertIn("action=process", line)
+        self.assertIn("turn=1/4", line)
+        self.assertIn("peer=%1", line)
+
+    def test_a_terminal_frame_records_why_it_ended(self) -> None:
+        """The case an accepted line is not implied by a reply that follows."""
+        self.as_agent(self.b)
+        self.receive(self.bootstrap(max="1"), "b")
+        line, = self.inbound_lines(self.b)
+        self.assertIn("outcome=accepted", line)
+        self.assertIn("action=stop", line)
+        self.assertIn("stop=max", line)
+
+    def test_a_refusal_after_the_header_is_trusted(self) -> None:
+        self.as_agent(self.b)
+        with self.assertRaises(ab.BridgeError):
+            self.receive(self.bootstrap(turn="2", bootstrap=""), "b")
+        line, = self.inbound_lines(self.b)
+        self.assertIn("outcome=refused", line)
+        self.assertIn("unsolicited frame", line)
+
+    def test_refusals_that_fire_before_the_header_is_trusted(self) -> None:
+        """The cases with no header at all, where the log is the only evidence."""
+        intact = self.bootstrap(body=self.SECRET)
+        cases = {
+            "malformed": "just prose, no frame here at all",
+            "checksum": intact.replace(self.SECRET, self.SECRET[:-1] + "X"),
+        }
+        # A separate pane per case, so each refusal lands in its own log.
+        for index, (tag, frame) in enumerate(cases.items()):
+            with self.subTest(case=tag):
+                identity = make_identity(self.root, f"%{50 + index}")
+                self.as_agent(identity)
+                with self.assertRaises(ab.BridgeError):
+                    self.receive(frame, f"pre-{tag}")
+                line, = self.inbound_lines(identity)
+                self.assertIn("outcome=refused", line)
+                self.assertNotIn("turn=", line, "no header was ever trusted")
+                self.assertNotIn(self.SECRET, line)
+
+    def test_a_wrong_server_is_recorded(self) -> None:
+        self.as_agent(self.b)
+        with self.assertRaises(ab.BridgeError):
+            self.receive(self.bootstrap(server="/tmp/other/default"), "b")
+        line, = self.inbound_lines(self.b)
+        self.assertIn("outcome=refused", line)
+        self.assertIn("different tmux server", line)
+
+    def test_no_body_content_reaches_the_log_either_way(self) -> None:
+        self.as_agent(self.b)
+        self.receive(self.bootstrap(body=self.SECRET), "b")
+        mangled = self.bootstrap(body=self.SECRET).replace(self.SECRET,
+                                                           self.SECRET + "!")
+        with self.assertRaises(ab.BridgeError):
+            self.receive(mangled, "b2")
+        written = Path(self.b["log_file"]).read_text(encoding="utf-8")
+        self.assertNotIn(self.SECRET, written,
+                         "an inbound body must never land in a durable file")
+
+    def test_only_a_prefix_of_the_bridge_token_is_written(self) -> None:
+        token = "d" * 32
+        self.as_agent(self.b)
+        self.receive(self.bootstrap(bridge=token), "b")
+        line, = self.inbound_lines(self.b)
+        self.assertIn(f"bridge={token[:8]}", line)
+        self.assertNotIn(token, line, "the log must not be a place to read tokens")
+
+    def test_a_failed_log_write_does_not_change_the_outcome(self) -> None:
+        """Diagnostics must never become the reason a receive fails."""
+        self.as_agent(self.b)
+        self.b["log_file"] = str(self.root / "no-such-dir" / "x.log")
+        noise = io.StringIO()
+        with contextlib.redirect_stderr(noise):
+            out = self.receive(self.bootstrap(), "b")
+        self.assertEqual(out["action"], "process")
+        self.assertIn("could not log", noise.getvalue())
+
+    def test_a_refused_line_marks_every_field_as_merely_claimed(self) -> None:
+        """Nothing on a refused line survived the checks that would make it true.
+
+        Marking only some fields would imply the rest were established, which is
+        worse than marking none — a later reader would learn the unmarked ones as
+        fact.
+        """
+        self.as_agent(self.b)
+        with self.assertRaises(ab.BridgeError):
+            self.receive(self.bootstrap(turn="2", bootstrap=""), "b")
+        line, = self.inbound_lines(self.b)
+        self.assertIn("peer_claimed=%1", line)
+        self.assertIn("turn_claimed=2/4", line)
+        self.assertIn("bridge_claimed=", line)
+        for bare in (" peer=", " turn=", " bridge="):
+            self.assertNotIn(bare, line, "a disputed value must not read as a fact")
+
+    def test_an_accepted_line_states_its_fields_plainly(self) -> None:
+        self.as_agent(self.b)
+        self.receive(self.bootstrap(), "b")
+        line, = self.inbound_lines(self.b)
+        self.assertIn(" peer=%1", line)
+        self.assertIn(" turn=1/4", line)
+        self.assertNotIn("_claimed", line, "these did survive every check")
+
+    def test_a_frame_arriving_after_an_abort_is_dropped_not_refused(self) -> None:
+        """Nothing was wrong with the frame; the bridge was switched off.
+
+        One word for both would destroy the distinction exactly where someone
+        needs it: the peer sees only silence and a timeout, and an abort is a
+        human action taken elsewhere and often forgotten.
+        """
+        self.as_agent(self.b)
+        Path(self.b["abort_file"]).write_text("")
+        with self.assertRaises(ab.BridgeError):
+            self.receive(self.bootstrap(), "b")
+        line, = self.inbound_lines(self.b)
+        self.assertIn("outcome=dropped", line)
+        self.assertNotIn("outcome=refused", line)
+        self.assertIn(self.b["abort_file"], line, "say which button did it")
+
+    def test_a_long_refusal_reason_is_trimmed(self) -> None:
+        """The real checksum message is a ~700-character paragraph.
+
+        Written for an agent reading stderr. Verbatim in the log, one refusal
+        dwarfs every other line and the file stops being scannable. Only a live
+        receive showed this; every other test here uses a short synthetic reason,
+        which is exactly why none of them caught it.
+        """
+        self.as_agent(self.b)
+        mangled = self.bootstrap(body="x" * 40).replace("x" * 40, "y" * 40)
+        with self.assertRaises(ab.BridgeError) as caught:
+            self.receive(mangled, "b")
+        self.assertGreater(len(str(caught.exception)), 400, "still verbose on stderr")
+        line, = self.inbound_lines(self.b)
+        self.assertLess(len(line), 400, "but bounded in the log")
+        self.assertIn("integrity check", line, "the diagnosis survives the cut")
+        self.assertIn("…", line, "and the cut is visible")
+
+    def test_a_detail_that_fits_is_left_alone(self) -> None:
+        self.assertEqual(ab.short_detail("short reason"), "short reason")
+
+    def test_a_long_unbroken_path_is_not_trimmed_to_nothing(self) -> None:
+        path = "/" + "a" * 300
+        trimmed = ab.short_detail(f"human abort signal detected: {path}")
+        self.assertGreater(len(trimmed), ab.DETAIL_LIMIT - 40)
+
+    def test_an_inbound_line_cannot_be_read_as_a_send(self) -> None:
+        self.as_agent(self.b)
+        self.receive(self.bootstrap(), "b")
+        line, = self.inbound_lines(self.b)
+        self.assertTrue(line.split(" ", 1)[1].startswith("inbound "))
+        self.assertNotIn("target=", line)
+
+
+class TestLogFileIsPrivate(TempRoot):
+    def test_a_new_log_is_created_0600(self) -> None:
+        path = self.root / "fresh.log"
+        with ab.open_log(path) as handle:
+            handle.write("x\n")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_an_existing_loose_log_is_tightened(self) -> None:
+        """The .json files were always 0600; the log was whatever umask gave."""
+        path = self.root / "loose.log"
+        path.write_text("old\n")
+        os.chmod(path, 0o644)
+        with ab.open_log(path) as handle:
+            handle.write("new\n")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertIn("old", path.read_text(), "tightening must not truncate")
+
+
+class TestBasisDedupeIsNotFooledByBodies(TempRoot):
+    """A send line carries body text, which can look like anything.
+
+    Found in my own previous commit: the dedupe was a substring search over the
+    whole file, so a body quoting this marker would suppress a real note.
+    """
+
+    def test_a_send_line_quoting_the_marker_does_not_suppress_the_note(self) -> None:
+        identity = make_identity(self.root, "%9")
+        identity["pane_basis"] = ab.BASIS_GUESS
+        path = Path(identity["log_file"])
+        quoted = json.dumps("discussing identity pane=%9 basis=focus-guess in prose")
+        path.write_text(f"2026-01-01T00:00:00+0000 target=%0 turn=1/4 "
+                        f"first_line={quoted}\n")
+        ab.log_identity_basis(identity)
+        notes = [ln for ln in path.read_text().splitlines()
+                 if ln.split(" ", 1)[1].startswith("identity pane=")]
+        self.assertEqual(len(notes), 1, "a quoted marker is not a written note")
+
+
 class TestParentPids(unittest.TestCase):
     def test_the_real_process_table_finds_our_own_parent(self) -> None:
         """Whatever this platform is, we must at least find our own parent."""
