@@ -199,6 +199,48 @@ def canonical_socket(socket: str) -> str:
         return socket
 
 
+def legacy_paths(raw_socket: str, socket: str, pane: str) -> dict[str, str]:
+    """Find files a pre-canonicalisation run of this same pane left behind.
+
+    Every per-pane path is keyed by a hash of the socket string, so canonicalising
+    that string moves the whole set. A bridge started before the change therefore
+    keeps running against files this process would never look at: `status` would
+    report an idle pane, `start` would happily open a second bridge alongside the
+    live one, and the abort command the human was handed would touch a sentinel
+    nothing reads. Silence is the wrong answer to that, so find the old files and
+    let the callers fail closed on them.
+
+    Empty strings when there is nothing to find, which is the normal case — the
+    two spellings only differ when the socket path went through a symlink.
+    """
+    if raw_socket == socket:
+        return {"legacy_state_file": "", "legacy_abort_file": ""}
+    prefix = state_root() / f"{hashlib.sha256(raw_socket.encode()).hexdigest()[:16]}-{pane[1:]}"
+    found = {}
+    for key, suffix in (("legacy_state_file", ".state.json"),
+                        ("legacy_abort_file", ".abort")):
+        path = prefix.with_suffix(suffix)
+        found[key] = str(path) if path.exists() else ""
+    return found
+
+
+def legacy_bridge_is_live(identity: dict[str, str]) -> dict[str, Any] | None:
+    """The old-path state, if it exists and still claims an active bridge."""
+    path = identity.get("legacy_state_file") or ""
+    if not path or not Path(path).exists():
+        return None
+    try:
+        value = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError):
+        # Unreadable is not the same as absent. Treat it as live, because the
+        # safe reading of "there is a file here I cannot parse" is "something may
+        # still be running", not "carry on".
+        return {"status": "unreadable"}
+    if not isinstance(value, dict) or value.get("status") in ("terminated", "timed_out"):
+        return None
+    return value
+
+
 def detect_identity() -> dict[str, str]:
     """Resolve this pane's own address, once, and cache it.
 
@@ -225,7 +267,7 @@ def detect_identity() -> dict[str, str]:
         socket = tmux_socket() or tmux_value("#{pid}")
     if not socket:
         raise BridgeError("could not determine tmux server socket identity")
-    socket = canonical_socket(socket)
+    raw_socket, socket = socket, canonical_socket(socket)
 
     prefix = state_root() / f"{hashlib.sha256(socket.encode()).hexdigest()[:16]}-{pane[1:]}"
     identity_file = prefix.with_suffix(".identity.json")
@@ -238,6 +280,7 @@ def detect_identity() -> dict[str, str]:
         "abort_file": str(prefix.with_suffix(".abort")),
         "global_abort_file": str(GLOBAL_ABORT),
     }
+    identity.update(legacy_paths(raw_socket, socket, pane))
     # Two buttons, deliberately not one. With several bridges running at once —
     # panes 1↔2 and 3↔4, say — the command printed every turn must stop only the
     # bridge the human is watching. `abort_command` is therefore the per-pane
@@ -264,7 +307,13 @@ def detect_identity() -> dict[str, str]:
 def identity_payload(identity: dict[str, str]) -> dict[str, Any]:
     keys = ("self_pane", "self_socket", "state_file", "log_file",
             "abort_file", "global_abort_file", "abort_command", "abort_all_command")
-    return {key: identity[key] for key in keys}
+    payload: dict[str, Any] = {key: identity[key] for key in keys}
+    # Only worth reporting when there is something there; an empty pair of keys on
+    # every single command would be noise the agent has to read past each turn.
+    for key in ("legacy_state_file", "legacy_abort_file"):
+        if identity.get(key):
+            payload[key] = identity[key]
+    return payload
 
 
 # --- state --------------------------------------------------------------------
@@ -330,10 +379,12 @@ def expire_stale(identity: dict[str, str],
 def check_abort(identity: dict[str, str]) -> None:
     """Two sentinels: one global so a human can stop every bridge with a single
     command they can remember, one per pane for stopping just this exchange."""
-    for key in ("global_abort_file", "abort_file"):
-        path = Path(identity[key])
-        if path.exists():
-            raise BridgeError(f"human abort signal detected: {path}")
+    # legacy_abort_file is the same button under its pre-canonicalisation name.
+    # A human handed the old abort command must not find it silently ignored.
+    for key in ("global_abort_file", "abort_file", "legacy_abort_file"):
+        raw = identity.get(key) or ""
+        if raw and Path(raw).exists():
+            raise BridgeError(f"human abort signal detected: {raw}")
 
 
 # --- bodies and frames --------------------------------------------------------
@@ -899,6 +950,19 @@ def command_start(args: argparse.Namespace) -> dict[str, Any]:
     # it here the same way receive/status do, so a peer that never replied — or
     # an agent that was aborted while owing one — does not wedge this pane until
     # someone thinks to run `status` by hand.
+    # Fail closed on a bridge this pane started before socket canonicalisation
+    # moved its files. Opening a second bridge alongside a live one is worse than
+    # refusing, and the human cannot see the clash without being told where it is.
+    stranded = legacy_bridge_is_live(identity)
+    if stranded:
+        raise BridgeError(
+            f"this pane has a bridge under its previous state path (status "
+            f"{stranded.get('status')}, turn {stranded.get('turn')}): "
+            f"{identity['legacy_state_file']}. It was started before the tmux "
+            f"socket path was canonicalised, so this process cannot manage it. "
+            f"Let it finish, or delete that file once you are sure it is dead."
+        )
+
     existing = expire_stale(identity, load_state(identity))
     if existing and existing.get("status") not in ("terminated", "timed_out"):
         expires = state_deadline(existing)
@@ -1080,12 +1144,16 @@ def command_reply(args: argparse.Namespace) -> dict[str, Any]:
 def command_status(_: argparse.Namespace) -> dict[str, Any]:
     identity = detect_identity()
     state = expire_stale(identity, load_state(identity))
-    aborted = [p for p in (identity["global_abort_file"], identity["abort_file"])
-               if Path(p).exists()]
+    aborted = [p for p in (identity["global_abort_file"], identity["abort_file"],
+                           identity.get("legacy_abort_file") or "")
+               if p and Path(p).exists()]
     expires = state_deadline(state)
-    blocked = bool(state and state.get("status") not in ("terminated", "timed_out"))
+    stranded = legacy_bridge_is_live(identity)
+    blocked = bool(stranded) or bool(
+        state and state.get("status") not in ("terminated", "timed_out"))
     return {"state": state, "abort_sentinels_present": aborted,
             "start_blocked": blocked,
+            "legacy_bridge": stranded,
             "expires_in_seconds": None if expires is None else max(
                 0, int(expires - time.time())),
             **identity_payload(identity)}
@@ -1099,13 +1167,15 @@ def clear_sentinels(identity: dict[str, str], *, include_global: bool) -> list[s
     panes 1↔2 and 3↔4, pane 3 clearing it would silently restart the exchange a
     human had just stopped in pane 1.
     """
-    keys = ("abort_file", "global_abort_file") if include_global else ("abort_file",)
+    keys = ["abort_file", "legacy_abort_file"]
+    if include_global:
+        keys.append("global_abort_file")
     removed = []
     for key in keys:
-        path = Path(identity[key])
-        if path.exists():
-            path.unlink()
-            removed.append(str(path))
+        raw = identity.get(key) or ""
+        if raw and Path(raw).exists():
+            Path(raw).unlink()
+            removed.append(raw)
     return removed
 
 
@@ -1142,9 +1212,20 @@ def command_reset(args: argparse.Namespace) -> dict[str, Any]:
         save_state(identity, {"status": "terminated", "reason": "reset by operator",
                               "bridge": previous.get("bridge"),
                               "turn": previous.get("turn")})
+    # A stranded pre-canonicalisation bridge is exactly the mess reset exists for,
+    # and refusing to touch it would leave start permanently blocked with no way
+    # out through the tool. Mark it terminated in place rather than deleting it,
+    # so the record of what was running survives.
+    stranded = legacy_bridge_is_live(identity)
+    if stranded:
+        atomic_json(Path(identity["legacy_state_file"]),
+                    {"status": "terminated", "reason": "reset by operator",
+                     "bridge": stranded.get("bridge"), "turn": stranded.get("turn"),
+                     "updated_at": time.time()})
     removed = clear_sentinels(identity, include_global=getattr(args, "all", False))
     blocked_by_global = Path(identity["global_abort_file"]).exists()
-    return {"released": previous, "abort_sentinels_removed": removed,
+    return {"released": previous, "released_legacy": stranded,
+            "abort_sentinels_removed": removed,
             "ready_for_new_bridge": not blocked_by_global,
             "global_abort_still_present": blocked_by_global,
             **identity_payload(identity)}

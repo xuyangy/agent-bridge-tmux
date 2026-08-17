@@ -12,6 +12,7 @@ Run: python3 -m unittest discover -s tests
 from __future__ import annotations
 
 import importlib.util
+import json
 import shutil
 import tempfile
 import time
@@ -982,6 +983,84 @@ class TestCanonicalSocket(TempRoot):
         # The last-resort identity is #{pid}, not a path. realpath would turn it
         # into a bogus absolute path relative to the cwd.
         self.assertEqual(ab.canonical_socket("48213"), "48213")
+
+
+class TestStrandedLegacyBridge(ExchangeCase):
+    """Canonicalising the socket string moves every per-pane path, so a bridge
+    started before that change keeps running against files this process would
+    otherwise never look at. Silence there is the dangerous answer: start would
+    open a second bridge beside a live one, and the abort command the human holds
+    would touch a sentinel nothing reads."""
+
+    def strand(self, status: str = "pending", turn: int = 1) -> str:
+        path = self.root / "old.state.json"
+        path.write_text(json.dumps(
+            {"status": status, "turn": turn, "bridge": "b" * 32,
+             "max": 4, "target": "%2", "updated_at": time.time()}))
+        self.a["legacy_state_file"] = str(path)
+        return str(path)
+
+    def test_start_refuses_while_an_old_path_bridge_is_live(self) -> None:
+        stranded = self.strand()
+        with self.assertRaises(ab.BridgeError) as caught:
+            self.start("hello")
+        self.assertIn(stranded, str(caught.exception))
+        self.assertEqual(self.wire.frames, [], "nothing may be sent while blocked")
+
+    def test_a_finished_old_path_bridge_does_not_block(self) -> None:
+        self.strand(status="terminated")
+        self.assertEqual(self.start("hello")["action"], "wait")
+
+    def test_an_unreadable_old_state_file_blocks(self) -> None:
+        # "A file I cannot parse" must read as "something may still be running".
+        path = self.root / "old.state.json"
+        path.write_text("{not json")
+        self.a["legacy_state_file"] = str(path)
+        with self.assertRaises(ab.BridgeError):
+            self.start("hello")
+
+    def test_status_reports_it_and_marks_the_pane_blocked(self) -> None:
+        self.strand()
+        result = ab.command_status(types.SimpleNamespace())
+        self.assertTrue(result["start_blocked"])
+        self.assertEqual((result["legacy_bridge"] or {}).get("status"), "pending")
+
+    def test_reset_releases_it_so_the_pane_is_usable_again(self) -> None:
+        stranded = self.strand()
+        ab.command_reset(types.SimpleNamespace(all=False))
+        self.assertEqual(json.loads(Path(stranded).read_text())["status"], "terminated")
+        self.assertEqual(self.start("hello")["action"], "wait")
+
+    def test_the_old_abort_sentinel_is_still_honoured(self) -> None:
+        # A human handed the pre-canonicalisation abort command must not find it
+        # silently ignored.
+        old = self.root / "old.abort"
+        old.touch()
+        self.a["legacy_abort_file"] = str(old)
+        with self.assertRaises(ab.BridgeError) as caught:
+            self.start("hello")
+        self.assertIn("abort signal", str(caught.exception))
+
+    def test_clear_abort_removes_the_old_sentinel_too(self) -> None:
+        old = self.root / "old.abort"
+        old.touch()
+        self.a["legacy_abort_file"] = str(old)
+        ab.command_clear_abort(types.SimpleNamespace(all=False))
+        self.assertFalse(old.exists())
+
+
+class TestLegacyPathDetection(TempRoot):
+    """legacy_paths only reports files that are really there, and only when the
+    two spellings of the socket actually differ."""
+
+    def test_identical_spellings_report_nothing(self) -> None:
+        found = ab.legacy_paths(SOCKET, SOCKET, "%1")
+        self.assertEqual(found, {"legacy_state_file": "", "legacy_abort_file": ""})
+
+    def test_a_differing_spelling_with_no_files_reports_nothing(self) -> None:
+        found = ab.legacy_paths("/tmp/x/default", "/private/tmp/x/default", "%1")
+        self.assertEqual(found["legacy_state_file"], "")
+        self.assertEqual(found["legacy_abort_file"], "")
 
 
 if __name__ == "__main__":
