@@ -91,7 +91,8 @@ is set the helper uses it; otherwise it uses the pane your process ancestry
 proves you are in; and failing both it falls back to the *focused* pane and warns
 on stderr — treat that warning as a problem to fix, not noise. It is now the only
 case left where your files are keyed to a guess, which makes it more worth acting
-on, not less.
+on, not less. An agent that has called `setsid`, or otherwise lost its terminal,
+still resolves correctly; only one orphaned from its parent falls back.
 
 Print the returned `abort_command` to the user **every turn**. The helper checks
 the sentinels immediately before every send, but the human needs the command in
