@@ -142,7 +142,22 @@ TAIL_LINES = 12
 
 
 class BridgeError(RuntimeError):
-    pass
+    """A refusal, optionally carrying a second wording safe for the log.
+
+    A few refusals quote the input back, because on stderr that is the whole
+    value of the message: the malformed-frame hint names the tail it actually
+    found, and a human comparing it against the prompt sees the clip at once.
+    The log has the opposite rule — log_inbound must never write peer bytes to a
+    durable file — so a message built from unvalidated input carries a
+    content-free restatement here, and the logger prefers it.
+
+    Absent on nearly every raise, because nearly every message is written from
+    constants and is already safe as it stands.
+    """
+
+    def __init__(self, *args: object, log_detail: str | None = None) -> None:
+        super().__init__(*args)
+        self.log_detail = log_detail
 
 
 # --- tmux plumbing ------------------------------------------------------------
@@ -892,7 +907,7 @@ def render_frame(meta: dict[str, str], body: str) -> str:
     return f"{FRAME_START} {header}>>> {encoded_body} {FRAME_END}"
 
 
-def malformed_hint(raw: str) -> str:
+def malformed_hint(raw: str) -> tuple[str, str]:
     """Name the likely reason a frame did not parse, from the text itself.
 
     "malformed agent bridge frame" on its own sent a reader looking at the
@@ -900,6 +915,13 @@ def malformed_hint(raw: str) -> str:
     — the escapes decoded so a one-line frame became sixty, or the last
     character clipped so the closing delimiter arrived one bracket short. The
     reader cannot tell those apart from the bare message, so say which it is.
+
+    Returns the hint and a short fixed label for the same branch. The hint is
+    for stderr and may quote the frame; the label is a constant chosen from this
+    function, so the log can say which branch fired without carrying a single
+    byte the peer wrote. The clipped-tail branch is why the split exists: the
+    tail it quotes is the end of an unvalidated body, and it was reaching the
+    log through str(exc).
     """
     stripped = raw.strip()
     lines = stripped.count("\n") + 1
@@ -907,25 +929,30 @@ def malformed_hint(raw: str) -> str:
         return (f"it is {lines} lines. A frame is exactly one line, and the "
                 f"backslash-n pairs in it are two literal characters, not line "
                 f"breaks. Save the frame again exactly as it appears, without "
-                f"decoding anything")
+                f"decoding anything"), "multiple lines"
     if not stripped.startswith(FRAME_START):
         return (f"it does not start with {FRAME_START}. Save from the opening "
-                f"marker through the closing marker, with nothing added or trimmed")
+                f"marker through the closing marker, with nothing added or "
+                f"trimmed"), "no opening delimiter"
     if not stripped.endswith(FRAME_END):
         tail = stripped[-len(FRAME_END):]
         return (f"it does not end with {FRAME_END}; it ends {tail!r}. The tail "
                 f"was clipped or altered in the copy. Save it again, to the last "
-                f"character")
+                f"character"), "clipped tail"
     if FRAME_START in stripped[len(FRAME_START):] or stripped.count(FRAME_END) > 1:
-        return ("it contains more than one frame delimiter. Save one frame only")
+        return ("it contains more than one frame delimiter. Save one frame "
+                "only"), "repeated delimiter"
     return ("the delimiters are present but the header between them is not "
-            "readable. Something inside the frame was altered in the copy")
+            "readable. Something inside the frame was altered in the copy"), \
+        "unreadable header"
 
 
 def parse_frame(raw: str) -> tuple[dict[str, str], str]:
     matches = list(FRAME_RE.finditer(raw))
     if not matches:
-        raise BridgeError(f"malformed agent bridge frame: {malformed_hint(raw)}")
+        hint, label = malformed_hint(raw)
+        raise BridgeError(f"malformed agent bridge frame: {hint}",
+                          log_detail=f"malformed agent bridge frame ({label})")
     if len(matches) > 1:
         raise BridgeError("input contains more than one frame; refusing to guess")
     match = matches[0]
@@ -1407,6 +1434,11 @@ def short_detail(detail: str) -> str:
     return cut.rstrip(" ,;:") + "…"
 
 
+def log_safe_detail(exc: BridgeError) -> str:
+    """The wording of a refusal that is safe to keep on disk."""
+    return exc.log_detail or str(exc)
+
+
 def log_inbound(identity: dict[str, str], meta: dict[str, str],
                 *, outcome: str, detail: str) -> None:
     """Record that a frame arrived and what was decided about it.
@@ -1442,6 +1474,9 @@ def log_inbound(identity: dict[str, str], meta: dict[str, str],
     token, a bad reply_to disputes the peer — so every field carries `_claimed`.
     Marking only some would imply the rest were established, which is worse than
     marking none.
+
+    Callers pass log_safe_detail(exc) rather than str(exc), which is what keeps
+    the first paragraph true for messages that quote the frame back.
 
     Never raises. A failed write must not change what receive decided.
     """
@@ -1580,8 +1615,19 @@ def command_receive(args: argparse.Namespace) -> dict[str, Any]:
 
     `meta` stays empty until parse_frame succeeds, so a refusal before that point
     is logged as a bare arrival rather than with invented header fields.
+
+    Reading the frame file happens BEFORE any of that. A missing or unreadable
+    scratch file is this pane's own accident and nothing arrived, so logging it
+    as an inbound refusal would state the one thing the log exists to settle,
+    and state it wrong.
     """
     identity = detect_identity()
+    # Receiving is often the whole of a run — a refusal, a drop, or a final turn
+    # that stops. Logging the basis only on the way out through send_message left
+    # exactly those runs unexplained, and an unverified pane may be writing into
+    # a stranger's files, which is when the basis matters most.
+    log_identity_basis(identity)
+    raw = read_text_file(args.frame_file, "frame file")
     meta: dict[str, str] = {}
     try:
         check_abort(identity)
@@ -1591,14 +1637,14 @@ def command_receive(args: argparse.Namespace) -> dict[str, Any]:
         # the peer will see only silence and then a timeout. Neither side's log
         # explained that before. The sentinel path rides in the detail, because
         # "which button did it" is the next question a reader has.
-        log_inbound(identity, meta, outcome="dropped", detail=str(exc))
+        log_inbound(identity, meta, outcome="dropped", detail=log_safe_detail(exc))
         raise
     try:
-        parsed, body = parse_frame(read_text_file(args.frame_file, "frame file"))
+        parsed, body = parse_frame(raw)
         meta = parsed
         result = validate_inbound(args, identity, meta, body)
     except BridgeError as exc:
-        log_inbound(identity, meta, outcome="refused", detail=str(exc))
+        log_inbound(identity, meta, outcome="refused", detail=log_safe_detail(exc))
         raise
     log_inbound(identity, meta, outcome="accepted",
                 detail=f"action={result['action']}"

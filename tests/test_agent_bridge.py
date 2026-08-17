@@ -1730,6 +1730,54 @@ class TestInboundIsLogged(ExchangeCase):
         self.assertNotIn(self.SECRET, written,
                          "an inbound body must never land in a durable file")
 
+    def test_a_clipped_frame_does_not_carry_its_tail_into_the_log(self) -> None:
+        """The one refusal whose wording is built out of the frame itself.
+
+        The malformed-frame hint quotes the last characters it found, which for a
+        frame clipped inside the body are body characters. On stderr that is the
+        whole point of the hint. In the log it is a peer writing into a durable
+        file, which is the invariant next door. The earlier no-body test missed
+        this because it only exercised the checksum path, where no hint is built.
+        """
+        self.as_agent(self.b)
+        clipped = self.bootstrap(body=self.SECRET)
+        clipped = clipped[:clipped.rindex(ab.FRAME_END)]
+        with self.assertRaises(ab.BridgeError) as caught:
+            self.receive(clipped, "b")
+        self.assertIn(self.SECRET[-10:], str(caught.exception),
+                      "stderr still gets the tail; that is what makes it useful")
+        line, = self.inbound_lines(self.b)
+        self.assertIn("clipped tail", line, "the branch is still named")
+        self.assertNotIn(self.SECRET[-10:], line)
+
+    def test_a_missing_frame_file_is_not_logged_as_an_arrival(self) -> None:
+        """Our own scratch file, not the peer's frame — nothing arrived.
+
+        An `inbound … refused` line here would answer the question the log exists
+        to answer, and answer it wrong: it would send the reader to the sender's
+        log for a frame the sender delivered fine.
+        """
+        self.as_agent(self.b)
+        with self.assertRaises(ab.BridgeError):
+            ab.command_receive(types.SimpleNamespace(
+                frame_file=str(self.root / "never-written.txt"),
+                body_out=str(self.root / "b-body.txt")))
+        self.assertEqual(self.inbound_lines(self.b), [])
+
+    def test_a_guessed_pane_is_explained_on_the_receive_path_too(self) -> None:
+        """A run that only receives never reaches send_message.
+
+        A refusal, a drop, or a final turn that stops are all whole runs, and an
+        unverified pane may be writing all of them into a stranger's files.
+        """
+        self.b["pane_basis"] = ab.BASIS_GUESS
+        self.as_agent(self.b)
+        with self.assertRaises(ab.BridgeError):
+            self.receive("just prose, no frame here at all", "b")
+        written = Path(self.b["log_file"]).read_text(encoding="utf-8")
+        self.assertIn(f"identity pane={self.b['self_pane']} basis=focus-guess",
+                      written)
+
     def test_only_a_prefix_of_the_bridge_token_is_written(self) -> None:
         token = "d" * 32
         self.as_agent(self.b)

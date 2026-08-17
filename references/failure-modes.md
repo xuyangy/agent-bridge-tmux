@@ -315,8 +315,11 @@ checksum failure is about seven hundred characters — which verbatim would leav
 one refusal dwarfing every other line. The diagnosis is at the front, so the cut
 keeps the useful half; stderr still gets the whole thing.
 
-**`identity …`** — written once, and only when `$TMUX_PANE` was not set, so its
-presence already tells you the pane was worked out rather than read. `basis=`
+**`identity …`** — written once per log, and only when `$TMUX_PANE` was not set,
+so its presence already tells you the pane was worked out rather than read. Its
+absence tells you nothing on its own: the line is written on the first send or
+receive of a run, so a run that did neither has not reached the point of writing
+it. `basis=`
 says how: `ancestry` is reconstructed and reliable, `focus-guess` is a guess and
 says so in its detail. See *Messages land in the wrong pane*.
 
