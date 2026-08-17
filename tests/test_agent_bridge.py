@@ -1230,5 +1230,68 @@ class TestLegacyGlobalSentinel(ExchangeCase):
         self.assertTrue(old.exists(), "a global stop is not cleared as a side effect")
 
 
+class TestSubmittedFalseNegative(unittest.TestCase):
+    """The mirror of the false-success bug, and just as damaging: a frame that
+    did land, reported as stuck. delivery then raises, the sender's state is
+    marked terminated, and the peer's reply is refused as unsolicited — an
+    exchange broken by a check, not by a failure. Both cases below are real
+    captures from a live Claude Code pane."""
+
+    def pane(self, screen: str) -> bool:
+        original = ab.run_tmux
+        setattr(ab, "run_tmux",
+                lambda *_a, **_k: types.SimpleNamespace(returncode=0, stdout=screen))
+        self.addCleanup(setattr, ab, "run_tmux", original)
+        return ab.submitted("%9")
+
+    def test_a_spinner_with_a_timer_but_no_esc_hint_reads_as_busy(self) -> None:
+        # "Roosting" is one of a rotating vocabulary that cannot be enumerated,
+        # and the esc hint is replaced by a tip line. The timer is what remains.
+        for line in ("✻ Roosting… (44s · thinking some more with high effort)",
+                     "✽ Puzzling… (7s · esc to interrupt)",
+                     "✻ Noodling… (120s · high effort)"):
+            with self.subTest(line=line):
+                self.assertTrue(self.pane(f"some output\n{line}\n❯ \n"))
+
+    def test_a_submitted_frame_above_a_tall_status_bar_is_not_read_as_stuck(self) -> None:
+        # The exact shape that broke: frame in the transcript, then a tip line,
+        # separators, the prompt, and a three-line status bar underneath.
+        screen = (f"{ab.FRAME_START} turn=3 >>> body {ab.FRAME_END}\n"
+                  "⎿  Tip: Use /permissions to pre-approve\n"
+                  "────────────────\n"
+                  "❯ \n"
+                  "────────────────\n"
+                  "📁 ~/wkdir/Git/agent-bridge-tmux 🌿 branch\n"
+                  "⏵⏵ auto mode on\n")
+        self.assertTrue(self.pane(screen))
+
+    def test_a_frame_actually_in_the_input_box_is_still_caught(self) -> None:
+        # The narrowed window must not blind the check it exists for.
+        self.assertFalse(self.pane(f"❯ {ab.FRAME_START} turn=3 >>> body {ab.FRAME_END}\n"))
+
+    def test_an_idle_pane_with_a_plain_prompt_is_unaffected(self) -> None:
+        self.assertTrue(self.pane("assistant output\n\n❯ \n"))
+
+
+class TestBusyWordingDoesNotOverreach(unittest.TestCase):
+    """looks_ready shares BUSY_RE, so a broader pattern must not mark an idle
+    pane busy — that would stall every send instead of every check."""
+
+    def test_ordinary_idle_panes_still_look_ready(self) -> None:
+        for screen in ("❯ \n",
+                       "✻ Claude Code v2.1.233\n❯ \n",
+                       "$ ls -la\ntotal 8\n$ \n",
+                       "took 3s to run the suite\n❯ \n",
+                       "the timeout is (30s) by default\n❯ \n"):
+            with self.subTest(screen=screen):
+                self.assertTrue(ab.looks_ready(screen))
+
+    def test_a_working_pane_still_looks_busy(self) -> None:
+        for screen in ("Thinking...\n", "(esc to interrupt)\n",
+                       "✻ Roosting… (44s · thinking)\n"):
+            with self.subTest(screen=screen):
+                self.assertFalse(ab.looks_ready(screen))
+
+
 if __name__ == "__main__":
     unittest.main()

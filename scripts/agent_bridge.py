@@ -68,7 +68,19 @@ FRAME_RE = re.compile(
 BUSY_RE = re.compile(
     r"(?:esc|escape|ctrl-c|control-c|ctrl\+c)[^\n]{0,32}(?:to )?(?:interrupt|stop|cancel)"
     r"|(?:^|\s)(?:thinking|working|generating|running tool|compacting)(?:…|\.\.\.)"
-    r"|\(\s*\d+s\s*[^\n)]*esc",
+    r"|\(\s*\d+s\s*[^\n)]*esc"
+    # A running elapsed-seconds counter, with or without an "esc to interrupt"
+    # beside it. Claude Code labels its spinner with a rotating vocabulary —
+    # "Roosting…", "Puzzling…", "Noodling…" — which cannot be enumerated, and it
+    # drops the esc hint while a tip line is showing. Observed live: a pane
+    # reading "✻ Roosting… (44s · thinking some more with high effort)" matched
+    # nothing above, so a frame it had already swallowed was reported as stuck.
+    # The timer is the part that is always there while it works.
+    # Deliberately not a bare "(30s)": that shape occurs in ordinary prose about
+    # timeouts, and matching it would mark an idle pane busy and stall every
+    # send. Require the separator dot, or at least one word after the count.
+    r"|\(\s*\d+s\s*·"
+    r"|\(\s*\d+s\s+[^\n)]*\)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -93,8 +105,11 @@ SUBMIT_CONFIRM_BACKOFF = (2.0, 4.0, 6.0, 8.0)
 SUBMIT_ATTEMPTS = int(os.environ.get("AGENT_BRIDGE_SUBMIT_ATTEMPTS", "4"))
 # The input box occupies only the bottom few lines. Looking wider would catch
 # the message again after it scrolled up into the transcript, and read a
-# delivered frame as a stuck one.
-INPUT_TAIL_LINES = 8
+# delivered frame as a stuck one — which is exactly what happened at 8 against a
+# pane with a three-line status bar and a tip line: the submitted frame sat
+# eight non-blank lines up and kept matching. Configurable because the right
+# number is a property of the target's chrome, not of this protocol.
+INPUT_TAIL_LINES = int(os.environ.get("AGENT_BRIDGE_INPUT_TAIL", "5"))
 # "notify" writes the focus-in escape to the target's pty so a TUI that holds
 # keystrokes while unfocused will accept them; nothing moves on screen. "off"
 # skips it, for a target that needs none of this.
