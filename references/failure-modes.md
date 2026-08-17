@@ -20,14 +20,52 @@ values mean the bridge cannot work. There is no supported workaround.
 
 ## Messages land in the wrong pane
 
-`$TMUX_PANE` was unset when identity was detected, so the fallback
-`tmux display-message -p '#{pane_id}'` returned whichever pane had **focus** at
-that moment.
+`$TMUX_PANE` was unset when identity was detected, so the pane had to be worked
+out some other way.
 
 `$TMUX_PANE` is set per pane and inherited by child processes, but it is dropped
 by `sudo` without `env_keep`, by `ssh remote cmd`, and by `env -i`. Detect once,
-early, in the pane's own shell. The helper prints a warning to stderr when it had
-to fall back — that warning is the bug report.
+early, in the pane's own shell.
+
+When it is missing, the helper resolves the pane in this order:
+
+1. **Process ancestry.** tmux starts each pane's command itself, so a pane's
+   `#{pane_pid}` is an ancestor of everything in that pane and of nothing in any
+   other. Walking our own ancestry against the pane list reconstructs what
+   `$TMUX_PANE` would have said. It prints a `note:` on stderr if the answer
+   differs from the focused pane, which is not a problem — it is the mechanism
+   working — but explains why the log went where it did.
+2. **The focused pane**, as a last resort, with a `warning:` on stderr. This is
+   a guess: `tmux display-message -p '#{pane_id}'` returns whichever pane had
+   focus at that moment, and a human switching panes changes it.
+
+### The hole that is still open
+
+Step 2 is reached when ancestry cannot tell, and the case that does it is a
+**daemonised or `setsid` agent** whose process tree was reparented away from the
+pane. Its chain runs to init and meets no pane pid, so it is indistinguishable
+from a process in no pane at all. If such an agent runs in a pane that does not
+have focus, every per-pane file is keyed to the wrong pane, silently:
+
+- **State** — the real occupant of the focused pane is told `this pane already
+  has an active bridge` and cannot start one.
+- **Log** — our `OUTBOUND` lines are written into their log file. For an
+  unattached session that log is the only record there is.
+- **Abort sentinel** — the `abort_command` printed every turn names *their*
+  sentinel, so a human stopping what they believe is our bridge stops theirs
+  too. That defeats the deliberate per-pane-versus-global split without anyone
+  typing the global command.
+
+None of this is visible to the frame checksum or the bridge token, because none
+of it is on the wire. Ancestry closed the cases it can detect; this is the case
+it cannot.
+
+**Setting `$TMUX_PANE` closes it completely**, and is the only thing that does.
+The warning tells you to run `tmux display-message -p '#{pane_id}'` *in the pane
+the agent runs in* and export that. It deliberately does not suggest
+`TMUX_PANE=<focused pane>`, because the focused pane is exactly the value that
+could not be verified, and making an unverified guess permanent is worse than
+leaving it as a guess.
 
 ## "target %N did not reach a confirmed idle prompt"
 
