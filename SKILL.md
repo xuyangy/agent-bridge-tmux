@@ -86,9 +86,12 @@ Run `identity` once, early, in this pane's own shell, and keep what it returns:
 `self_pane`, `self_socket`, the state/log paths, and `abort_command`.
 
 Detect early because `$TMUX_PANE` is inherited by child processes but lost across
-`sudo` without `env_keep`, across `ssh remote cmd`, and across `env -i`. If it is
-missing the helper falls back to the *focused* pane and warns on stderr — treat
-that warning as a problem to fix, not noise.
+`sudo` without `env_keep`, across `ssh remote cmd`, and across `env -i`. When it
+is set the helper uses it; otherwise it uses the pane your process ancestry
+proves you are in; and failing both it falls back to the *focused* pane and warns
+on stderr — treat that warning as a problem to fix, not noise. It is now the only
+case left where your files are keyed to a guess, which makes it more worth acting
+on, not less.
 
 Print the returned `abort_command` to the user **every turn**. The helper checks
 the sentinels immediately before every send, but the human needs the command in
