@@ -42,6 +42,10 @@ work around the guard.
 A turn is one outbound frame. Turn 1 is A's opening message; the last permitted
 frame is `turn=MAX_TURNS`.
 
+If the user gives no `MAX_TURNS`, omit `--max-turns` and let the helper use its
+default of 10. Do not invent a number, and do not copy one out of an example log
+line in these docs — those numbers describe the sample exchange, not your run.
+
 There is deliberately no reply-pane input. If the user offers one, ignore it and
 use your detected pane — a hand-typed reply address is the exact failure this
 design removes.
@@ -119,8 +123,8 @@ mentioned.
    <your result>
    ```
 
-3. Run `start` with that body file, `TARGET_PANE`, `MAX_TURNS`, and
-   `GOAL_PHRASE` if there is one.
+3. Run `start` with that body file and `TARGET_PANE`, plus `MAX_TURNS` and
+   `GOAL_PHRASE` if the user gave them.
 4. Report the `OUTBOUND` log line, the abort command, and the ack deadline. Then
    end your turn, so your pane goes idle and B's reply can land.
 
