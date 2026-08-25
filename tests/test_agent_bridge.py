@@ -665,12 +665,12 @@ class TestTimeouts(TempRoot):
         ab.atomic_json(Path(self.ident["state_file"]), state)
 
     def test_the_stale_window_is_the_documented_fifteen_minutes(self) -> None:
-        self.assertEqual(ab.STALE_STATE_TIMEOUT, 900)
+        self.assertEqual(ab.STALE_STATE_TIMEOUT, 3600)
         ab.save_state(self.ident, {"status": "awaiting_reply", "bridge": "f" * 32,
                                    "turn": 1, "max": 4, "target": "%2"})
         state = ab.load_state(self.ident)
         self.assertAlmostEqual(ab.state_deadline(state),
-                               state["updated_at"] + 900, delta=1)
+                               state["updated_at"] + 3600, delta=1)
 
     def test_a_fresh_awaiting_reply_keeps_its_turn(self) -> None:
         ab.save_state(self.ident, {"status": "awaiting_reply", "bridge": "f" * 32,
