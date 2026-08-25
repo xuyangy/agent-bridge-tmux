@@ -228,7 +228,9 @@ For every other ending, stop sending and ask. Two kinds reach here:
 
 Do not quietly retry and do not quietly give up. Say which ending it was, on
 which turn, and what the exchange had reached. Then put exactly two options to
-the user and wait for the answer:
+the user through the harness's question tool, e.g. `AskUserQuestion` in Claude
+Code, and wait. Fall back to a numbered list only where no such tool exists. The
+options are:
 
 1. **Continue.** Run `reset`, then `start` a *new* bridge to the same pane. The
    new body must carry the exchange forward: what had been established, what
@@ -239,10 +241,11 @@ the user and wait for the answer:
    further.
 
 Say in the *Continue* option how many turns it would grant, so a bare choice is
-answerable. Most harnesses let the user attach a note to the option they pick, or
-type a free-form answer instead of picking; a count that arrives that way wins
-over your suggestion. Only ask a second question when the answer carried no
-number at all.
+answerable. Put that count in the option label, not only in the prose around it.
+The question tool lets the user attach a note to the option they pick, or type a
+free-form answer instead of picking; a count or an instruction that arrives that
+way wins over your suggestion. Only ask a second question when the answer carried
+no number at all.
 
 Never resend the old frame under either choice. Its token died with the old
 bridge and the peer refuses it — that refusal is the design working.

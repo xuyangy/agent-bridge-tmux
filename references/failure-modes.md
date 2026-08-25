@@ -225,7 +225,9 @@ The peer's reply arrived after the deadline (default 3600s, override with
 
 This bridge is over, but the conversation need not be. Report the timeout and ask
 the user to choose: reset and open a fresh bridge that carries the context
-forward, or reset and stop. Do not pick for them, and do not resend either way.
+forward, or reset and stop. Ask through the harness's question tool, e.g.
+`AskUserQuestion` in Claude Code, falling back to a numbered list only where none
+exists. Do not pick for them, and do not resend either way.
 The same two options apply when the turn limit runs out.
 
 If a peer routinely needs longer — a deep review of a large diff, say — raise the
