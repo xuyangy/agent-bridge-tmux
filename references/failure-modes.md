@@ -223,6 +223,11 @@ precisely because counting turns by hand is the thing models get wrong.
 The peer's reply arrived after the deadline (default 3600s, override with
 `AGENT_BRIDGE_ACK_TIMEOUT`). The bridge is over; do not restart it by resending.
 
+This bridge is over, but the conversation need not be. Report the timeout and ask
+the user to choose: reset and open a fresh bridge that carries the context
+forward, or reset and stop. Do not pick for them, and do not resend either way.
+The same two options apply when the turn limit runs out.
+
 If a peer routinely needs longer — a deep review of a large diff, say — raise the
 timeout deliberately at the start rather than discovering it mid-exchange.
 

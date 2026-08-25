@@ -193,6 +193,10 @@ refusal is the system working, not an obstacle to route around:
 - the tmux server identity does not match
 - a human creates an abort sentinel
 
+Stopping sends is not the same as closing the exchange for good. Unless the
+reason was `GOAL_PHRASE` or a human's abort sentinel, see *Ending is the user's
+call* below before you decide anything.
+
 `status` reports the state and expires it if its deadline has passed.
 `start_blocked` tells you whether this pane can open a new bridge, and
 `expires_in_seconds` says how long until it can.
@@ -207,6 +211,50 @@ deliberately leaves bridge state alone.
 A blind resend is the one tempting mistake here. If the first message did arrive
 and the peer was merely slow, resending puts two overlapping conversations in its
 queue — worse than a stall, and much harder to read afterwards.
+
+## Ending is the user's call, not yours
+
+Only two endings are final on their own: a body carrying `GOAL_PHRASE` — the
+answer arrived — and a human's own abort sentinel. Report those and stop, asking
+nothing.
+
+For every other ending, stop sending and ask. Two kinds reach here:
+
+- **The turn limit.** `turn` reached `max`. Nothing is wrong; the budget simply
+  ran out, possibly mid-thought.
+- **A break.** A missed acknowledgement deadline, `status` reporting a timeout,
+  readiness failing, a peer that crashed, or a pane still holding `pending` or
+  `awaiting_reply` state.
+
+Do not quietly retry and do not quietly give up. Say which ending it was, on
+which turn, and what the exchange had reached. Then put exactly two options to
+the user and wait for the answer:
+
+1. **Continue.** Run `reset`, then `start` a *new* bridge to the same pane. The
+   new body must carry the exchange forward: what had been established, what
+   question is still open, and one line saying why the last bridge ended. Pass
+   the granted turn count as `--max-turns` — the counter starts again at 1, and
+   the new bridge gets its own token, so nothing from the old one is reusable.
+2. **Stop.** Run `reset`, report the outcome and the log path, and send nothing
+   further.
+
+Say in the *Continue* option how many turns it would grant, so a bare choice is
+answerable. Most harnesses let the user attach a note to the option they pick, or
+type a free-form answer instead of picking; a count that arrives that way wins
+over your suggestion. Only ask a second question when the answer carried no
+number at all.
+
+Never resend the old frame under either choice. Its token died with the old
+bridge and the peer refuses it — that refusal is the design working.
+
+One thing `reset` cannot reach: the peer's pane. If it is still sitting in
+`awaiting_reply`, your fresh bootstrap frame is refused there with `no new frame
+is expected in the current bridge state`, until its own stale timeout expires.
+Tell the user that the peer pane needs its own `reset`; you cannot run it for
+them.
+
+Asking is not a licence to keep going. Each round is a fresh, explicit decision
+by the human, never a default and never a loop you drive yourself.
 
 ## Visibility and closing out
 

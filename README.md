@@ -91,7 +91,7 @@ unstick this.
 
 ## What stops a bridge
 
-- the turn limit is reached — hard, no exceptions
+- the turn limit is reached — hard; no frame goes out past it
 - the goal phrase appears
 - the target pane never goes idle
 - the frame could not be submitted into the peer's input box
@@ -100,6 +100,12 @@ unstick this.
 - an unfinished bridge goes stale (default 3600s, set `AGENT_BRIDGE_STALE_TIMEOUT`)
 - the peer is on another tmux server
 - you create the abort file
+
+Only the goal phrase and your own abort file end things for good. For every other
+reason — the turn limit included — the agent should tell you how the exchange
+ended and offer you two choices: reset and open a fresh bridge that carries the
+context forward, with however many turns you grant it, or reset and stop. It does
+not decide that on its own, and it never continues without you saying so.
 
 ## If a message gets stuck in the other pane
 
