@@ -36,7 +36,7 @@ work around the guard.
 | --- | --- |
 | `TARGET_PANE` | Agent B's pane id, `%<digits>` — the one thing your environment cannot tell you |
 | `TASK` | the initial task, e.g. "Review the uncommitted changes" |
-| `MAX_TURNS` | maximum total framed messages, default 10 |
+| `MAX_TURNS` | maximum total framed messages, default 12 |
 | `GOAL_PHRASE` | optional exact phrase that ends the exchange early |
 
 A turn is one outbound frame. Turn 1 is A's opening message; the last permitted

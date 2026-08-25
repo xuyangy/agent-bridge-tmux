@@ -31,7 +31,7 @@ Things you can set, all optional:
 
 | You say | Effect |
 | --- | --- |
-| "max 6 turns" | hard stop after 6 messages total (default 10) |
+| "max 6 turns" | hard stop after 6 messages total (default 12) |
 | "stop when it says LOOKS GOOD" | stop early on that exact phrase |
 | "bridge to %7" | skip the window lookup, use that pane |
 

@@ -1875,7 +1875,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     start = subparsers.add_parser("start", help="send the initial framed message")
     start.add_argument("--target", required=True)
-    start.add_argument("--max-turns", type=int, default=10)
+    start.add_argument("--max-turns", type=int, default=12)
     start.add_argument("--body-file", required=True)
     start.add_argument("--goal-phrase")
     start.set_defaults(func=command_start)
