@@ -146,6 +146,41 @@ class TestFraming(TempRoot):
         parsed, _ = ab.parse_frame(ab.render_frame(meta, "body"))
         self.assertEqual(ab.goal_from_meta(parsed), "SHIP IT — done'ish \"ok\"")
 
+    def test_sender_cwd_survives_a_hostile_directory_name(self) -> None:
+        # A directory may legitimately contain a quote, a space, or a ">" — and
+        # a raw ">" in a header truncates the frame at the parser. Base64 is
+        # what makes every path safe to carry.
+        hostile = "/tmp/a dir with 'quotes' and > a caret/sub"
+        meta = dict(self.META)
+        meta["cwd_b64"] = ab.b64url_encode(hostile)
+        frame = ab.render_frame(meta, "body")
+        self.assertEqual(frame.count(ab.FRAME_END), 1)
+        parsed, _ = ab.parse_frame(frame)
+        self.assertEqual(ab.sender_cwd_from_meta(parsed), hostile)
+
+    def test_sender_cwd_is_optional(self) -> None:
+        # An older sender omits the field entirely; that is not an error, and
+        # the receiver simply has no cwd to report.
+        parsed, _ = ab.parse_frame(ab.render_frame(dict(self.META), "body"))
+        self.assertNotIn("cwd_b64", parsed)
+        self.assertIsNone(ab.sender_cwd_from_meta(parsed))
+
+    def test_sender_cwd_is_covered_by_the_frame_checksum(self) -> None:
+        # Informational does not mean unsigned: a tampered cwd must fail the
+        # same integrity check as any other header field.
+        meta = dict(self.META)
+        meta["cwd_b64"] = ab.b64url_encode("/real/place")
+        frame = ab.render_frame(meta, "body")
+        tampered = frame.replace(ab.b64url_encode("/real/place"),
+                                 ab.b64url_encode("/other/place"))
+        self.assertNotEqual(tampered, frame)
+        with self.assertRaisesRegex(ab.BridgeError, "integrity check"):
+            ab.parse_frame(tampered)
+
+    def test_sender_cwd_field_reports_this_process(self) -> None:
+        self.assertEqual(ab.sender_cwd_field(),
+                         {"cwd_b64": ab.b64url_encode(os.getcwd())})
+
 
 # --- 1b. long bodies travel by file -------------------------------------------
 
@@ -428,6 +463,56 @@ class TestExchange(ExchangeCase):
 
 
 # --- 3b. what receive rejects -------------------------------------------------
+
+
+class TestSenderCwd(ExchangeCase):
+    def cwd_of(self, tag: str, frame: str) -> str | None:
+        return self.receive(frame, tag)["sender_cwd"]
+
+    def frame(self, **overrides: str) -> str:
+        meta = {"turn": "1", "max": "4", "reply_to": "%9", "server": SOCKET,
+                "bridge": "d" * 32, "bootstrap": "agent-bridge"}
+        meta.update(overrides)
+        return ab.render_frame(meta, "hello")
+
+    def test_receive_reports_the_senders_cwd(self) -> None:
+        self.as_agent(self.b)
+        frame = self.frame(cwd_b64=ab.b64url_encode("/Users/someone/work/api"))
+        self.assertEqual(self.cwd_of("b", frame), "/Users/someone/work/api")
+
+    def test_a_frame_without_a_cwd_is_still_accepted(self) -> None:
+        self.as_agent(self.b)
+        self.assertIsNone(self.cwd_of("b", self.frame()))
+
+    def test_a_cwd_unlike_the_receivers_is_not_an_error(self) -> None:
+        # Cross-checkout review is the point: worktrees, subdirectories and
+        # symlink spellings all differ legitimately, so nothing compares them.
+        self.as_agent(self.b)
+        frame = self.frame(cwd_b64=ab.b64url_encode("/somewhere/else/entirely"))
+        result = self.receive(frame, "b")
+        self.assertEqual(result["action"], "process")
+        self.assertEqual(result["sender_cwd"], "/somewhere/else/entirely")
+
+    def test_start_stamps_the_cwd_into_the_frame(self) -> None:
+        self.as_agent(self.a)
+        self.start("hello", max_turns=4)
+        meta, _ = ab.parse_frame(self.wire.last)
+        self.assertEqual(ab.sender_cwd_from_meta(meta), os.getcwd())
+
+    def test_reply_stamps_the_cwd_too(self) -> None:
+        self.as_agent(self.a)
+        self.start("hello", max_turns=4)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        self.reply("answer", "b")
+        meta, _ = ab.parse_frame(self.wire.last)
+        self.assertEqual(meta["turn"], "2")
+        self.assertEqual(ab.sender_cwd_from_meta(meta), os.getcwd())
+
+    def test_a_corrupt_cwd_encoding_is_refused(self) -> None:
+        self.assertIsNone(ab.sender_cwd_from_meta({}))
+        with self.assertRaisesRegex(ab.BridgeError, "invalid sender cwd encoding"):
+            ab.sender_cwd_from_meta({"cwd_b64": "not base64!"})
 
 
 class TestReceiveRejects(ExchangeCase):

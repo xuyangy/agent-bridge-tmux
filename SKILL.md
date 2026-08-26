@@ -241,6 +241,14 @@ name its absolute path separately.
   your own directory.** Say in your reply that the path was ambiguous and ask for
   the absolute one.
 
+`receive` also reports `sender_cwd`: the directory the peer's helper process was
+in when it sent the frame. It is a raw observation, stamped automatically and
+signed with the rest of the header. It is not a verified project root, not a
+promise the path exists on your disk, and it is never compared against anything —
+a subdirectory, a scratch directory, or an entirely different checkout are all
+legitimate. The body's `Project:` line stays the authority on which root the task
+is about; `sender_cwd` is context for when it is missing or unclear.
+
 ## Replying
 
 Do the work, write only your response to a fresh scratch file, then run `reply`
