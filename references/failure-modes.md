@@ -210,19 +210,37 @@ target whose paste rendering that check cannot read.
 A frame with no `sum=` field at all means the sender is running an older
 `agent_bridge.py`; update both sides to the same version.
 
-## The copy, not the wire: `receive --from-pane`
+### When the copy is the culprit, not the transport
 
-Seen twice against a Codex pane, with a 3-4 KB frame. The first copy arrived with
-every `"` turned into `\"`, one backslash doubled, and every 2-space indent
-dropped — refused by the checksum. The second arrived as 16 lines, broken exactly
-where the pane wrapped, with the display's indentation baked in — refused as
-`malformed agent bridge frame (multiple lines)`. Both frames left the sender as a
-single valid line; the sender's own saved copy proves it. The receiving agent was
-rebuilding the frame from its rendered transcript, not from the text.
+Observed in the field, and the more common cause by far: the transport was
+perfect and the *copy* was not. Twice against the same Codex pane. A 4.2 KB
+one-line body was re-typed out of the receiving model's prompt rather than
+copied: every `"` came back as `\"`, one `\n` became `\\n`, and every two-space
+continuation indent was dropped. 4206 characters sent, 4197 saved. The next
+frame, 3.2 KB, arrived as 16 lines broken exactly where the pane wrapped, with
+the display's indentation baked in, and was refused as `malformed agent bridge
+frame (multiple lines)`. Both frames left the sender as a single valid line;
+the sender's own saved copy proves it. The receiving agent was rebuilding each
+frame from its rendered transcript, not from the text.
 
-No amount of transport hardening fixes that, because the corruption happens after
-delivery, inside the reader. So the sender writes every frame verbatim to
-`<socket-hash>-<pane>.outbound.txt` beside its log, and the receiver runs:
+Tell these apart by the size and shape of the frame. A dropped-keystroke failure
+loses characters from the middle of a run. A bad copy shows systematic edits:
+escaped quotes, doubled backslashes, lost indentation, a re-wrapped line.
+
+Two fixes, and they work at opposite ends. Both are in place.
+
+**Shrink what is copied.** A body over a few hundred characters is written to a
+file under the bridge state directory, and the frame carries `body_file=` and
+`body_sha=` instead of the text. The pointer sits in the header, so `sum=`
+covers it; the SHA-256 then covers the file. The frame is about 350 characters
+with no quotes, no escapes and no indentation — very little for a copy to get
+wrong — and the body never passes through a prompt at all.
+
+**Or remove the copy.** Shrinking helps every reader but guarantees nothing: at
+a typical pane width even 350 characters wraps onto a second row, and a reader
+that rebuilds frames from its own display will still break one eventually. So
+the sender writes every frame verbatim to `<socket-hash>-<pane>.outbound.txt`
+beside its log, and a receiver that cannot copy runs:
 
 ```bash
 python3 "$SCRIPT" receive --from-pane %N --body-out body.txt
@@ -233,6 +251,25 @@ has to be passed around, and the frame's `reply_to` must match the pane named.
 Token, turn, checksum and server checks are unchanged — this replaces the copy,
 not the validation. `no frame from %N on this server` means that pane has sent
 nothing, or its helper predates the feature.
+
+So a *long* frame that fails its integrity check now means the sender is running
+an older `agent_bridge.py`. Update both sides.
+
+## "the body file this frame points at is gone"
+
+The pointer arrived intact and the file behind it did not. Body files are swept
+after 24 hours, and a reboot clears the temp directory outright. Nothing was
+corrupted and nothing can be reconstructed: ask the sender to send the turn
+again. Never guess at the contents.
+
+Two neighbouring refusals, both deliberate:
+
+- *"does not match the checksum in the frame"* — the file changed after it was
+  sent. Same remedy: a resend, never a repair.
+- *"points at a body file outside the bridge body directory"* — a frame naming
+  a path elsewhere on disk is refused before it is opened. A frame is not a
+  licence to read arbitrary files, even though `sum=` proves the sender wrote
+  the path.
 
 ## The frame arrives split across several prompts
 

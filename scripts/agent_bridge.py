@@ -898,6 +898,88 @@ def decode_body(body: str, encoding: str | None) -> str:
     raise BridgeError(f"unsupported body encoding: {encoding}")
 
 
+# Above this many characters on the wire, a body is written to a file and the
+# frame carries a pointer to it instead of the text. The frame is copied by hand
+# — a model reads it out of its prompt and saves it — and that copy is where
+# large bodies die: observed in the field, a 4.2 KB one-line body came back with
+# every `"` escaped, one `\n` doubled, and every two-space continuation indent
+# dropped. The checksum caught it, as designed, but the turn was still lost. A
+# short pointer frame has no quotes, no escapes and no indentation to get wrong,
+# and the body itself never passes through a model at all. Both panes are the
+# same user on the same machine, so a file is a transport they already share.
+MAX_INLINE_BODY = 800
+SPILL_MARKER = "(body-in-file)"
+SPILL_MAX_AGE = 24 * 3600
+
+
+def spill_dir() -> Path:
+    return secure_dir(state_root() / "bodies")
+
+
+def spill_body(meta: dict[str, str], body: str) -> Path:
+    """Write a body out for the peer to read, and sweep old ones away.
+
+    Named after the bridge token and turn, so two live bridges cannot collide and
+    a file left behind is traceable to the exchange that made it. Written 0600
+    inside the same verified-private root as every other bridge file.
+    """
+    directory = spill_dir()
+    for stale in directory.glob("*.body"):
+        try:
+            if time.time() - stale.stat().st_mtime > SPILL_MAX_AGE:
+                stale.unlink()
+        except OSError:
+            pass
+    path = directory / f"{meta['bridge'][:16]}-{meta['turn']}.body"
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(body)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+    return path
+
+
+def read_spilled_body(meta: dict[str, str], wire_body: str) -> str:
+    """Read a pointed-at body, and trust it only if it hashes to what was sent.
+
+    The pointer travels inside the header, so the frame checksum already proves
+    the path and the hash are the ones the sender wrote. What is left to check is
+    the file: that it is inside our own private root and not a symlink out of it,
+    and that its bytes are the bytes the sender hashed. A missing file gets its
+    own message, because it means the sender's scratch was cleaned up — nothing
+    was corrupted, and the fix is a resend, not a repair.
+    """
+    if wire_body != SPILL_MARKER:
+        raise BridgeError("frame names a body file but also carries an inline body")
+    if meta.get("enc"):
+        raise BridgeError("a frame with a body file must not declare a wire encoding")
+    if not re.fullmatch(r"[0-9a-f]{64}", meta["body_sha"]):
+        raise BridgeError("invalid body checksum")
+    path = Path(meta["body_file"])
+    root = Path(os.path.realpath(spill_dir()))
+    if Path(os.path.realpath(path)).parent != root:
+        raise BridgeError(
+            f"frame points at a body file outside the bridge body directory "
+            f"({root}); refusing to read it"
+        )
+    if path.is_symlink() or not path.is_file():
+        raise BridgeError(
+            f"the body file this frame points at is gone or is not a regular file: "
+            f"{path}. Nothing was corrupted; the sender's scratch was removed. Ask "
+            f"the sender to send the turn again."
+        )
+    try:
+        body = path.read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BridgeError(f"cannot read the body file {path}: {exc}") from exc
+    if hashlib.sha256(body.encode()).hexdigest() != meta["body_sha"]:
+        raise BridgeError(
+            "the body file does not match the checksum in the frame: its contents "
+            "changed after it was sent. Do not process it and do not repair it; "
+            "ask the sender to send the turn again."
+        )
+    return body
+
+
 def frame_digest(meta: dict[str, str], encoded_body: str) -> str:
     """Truncated SHA-256 over the header fields and the on-wire body.
 
@@ -924,6 +1006,13 @@ def render_frame(meta: dict[str, str], body: str) -> str:
     for key in ("bootstrap", "goal_b64", "stop"):
         if meta.get(key):
             values[key] = meta[key]
+    # A long body goes to a file and the frame carries only the pointer. The
+    # pointer lives in the header, so the frame checksum covers it; the sha256
+    # then covers the file. Nothing is trusted that was not signed.
+    if len(encoded_body) > MAX_INLINE_BODY:
+        values["body_file"] = str(spill_body(meta, body))
+        values["body_sha"] = hashlib.sha256(body.encode()).hexdigest()
+        encoded_body, encoding = SPILL_MARKER, None
     if encoding:
         values["enc"] = encoding
     fields = [f"{key}={shlex.quote(value)}" for key, value in values.items()]
@@ -1026,8 +1115,9 @@ def parse_frame(raw: str) -> tuple[dict[str, str], str]:
             "something changed — text re-wrapped so an escape and a space swapped "
             "places, an escape decoded, a character clipped off the end. If you "
             "retyped or reformatted the frame, save it again byte for byte from "
-            "the prompt instead. Ask the sender for a short frame that names a "
-            "file to read, which removes the copy entirely. Only if the sender "
+            "the prompt instead. Bodies over a few hundred characters travel as a "
+            "short frame naming a file, so a long frame means the sender is "
+            "running an older agent_bridge.py. Only if the sender "
             "sees this repeatedly with a verbatim copy is it the transport, and "
             "then AGENT_BRIDGE_TYPE=paste or a larger AGENT_BRIDGE_CHUNK_PAUSE "
             "is the lever."
@@ -1036,8 +1126,11 @@ def parse_frame(raw: str) -> tuple[dict[str, str], str]:
     required = {"turn", "max", "reply_to", "server", "bridge"}
     if not required.issubset(meta):
         raise BridgeError("frame header is missing required fields")
-    if set(meta) - (required | {"bootstrap", "goal_b64", "stop", "enc"}):
+    if set(meta) - (required | {"bootstrap", "goal_b64", "stop", "enc",
+                                "body_file", "body_sha"}):
         raise BridgeError("frame header contains unsupported fields")
+    if ("body_file" in meta) != ("body_sha" in meta):
+        raise BridgeError("frame names a body file without its checksum, or the reverse")
     if not PANE_RE.fullmatch(meta["reply_to"]):
         raise BridgeError("invalid reply_to pane id")
     if not BRIDGE_RE.fullmatch(meta["bridge"]):
@@ -1053,6 +1146,8 @@ def parse_frame(raw: str) -> tuple[dict[str, str], str]:
     if meta.get("stop") not in (None, "goal", "max"):
         raise BridgeError("invalid stop marker")
 
+    if "body_file" in meta:
+        return meta, read_spilled_body(meta, match.group("body"))
     return meta, decode_body(match.group("body"), meta.get("enc"))
 
 

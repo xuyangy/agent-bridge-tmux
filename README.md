@@ -141,6 +141,13 @@ The default transport (`AGENT_BRIDGE_TYPE=paste`) hands the frame over as one
 atomic paste, so there are no keystrokes to drop. If you have set
 `AGENT_BRIDGE_TYPE=type`, put it back to `paste`.
 
+The other cause is the copy, not the transport: the receiving agent re-types the
+frame out of its prompt instead of saving it byte for byte, and escapes quotes
+or drops indentation on the way. So a body over a few hundred characters is
+written to a file and the frame carries only the path and a SHA-256 of the
+contents — about 350 characters, with no quotes and no escapes to get wrong.
+This is automatic; both sides just need the same version of the script.
+
 ## Tests
 
 ```bash

@@ -147,6 +147,77 @@ class TestFraming(TempRoot):
         self.assertEqual(ab.goal_from_meta(parsed), "SHIP IT — done'ish \"ok\"")
 
 
+# --- 1b. long bodies travel by file -------------------------------------------
+
+
+class TestSpilledBody(TempRoot):
+    """The frame is copied by a model, so a long body must not be in it.
+
+    The field failure these cover: a 4.2 KB one-line body was re-typed rather
+    than copied, arriving with quotes escaped, a backslash doubled and every
+    continuation indent dropped. Nothing here can fix a bad copy — the checksum
+    already refuses one — so the fix is that there is nothing long left to copy.
+    """
+
+    META = {
+        "turn": "3", "max": "6", "reply_to": "%2", "server": SOCKET,
+        "bridge": "c" * 32,
+    }
+
+    def big(self) -> str:
+        return "\n".join(f'  - a finding with "quotes" and an indent, number {i}'
+                          for i in range(200))
+
+    def test_a_long_body_leaves_the_frame_short(self) -> None:
+        body = self.big()
+        frame = ab.render_frame(dict(self.META), body)
+        self.assertGreater(len(body), 4000)
+        self.assertLess(len(frame), 400, "a pointer frame must stay easy to copy")
+        self.assertIn(ab.SPILL_MARKER, frame)
+        self.assertNotIn("quotes", frame)
+        meta, decoded = ab.parse_frame(frame)
+        self.assertEqual(decoded, body)
+        self.assertEqual(meta["body_sha"], ab.hashlib.sha256(body.encode()).hexdigest())
+
+    def test_a_short_body_still_travels_inline(self) -> None:
+        frame = ab.render_frame(dict(self.META), "still readable in the pane")
+        self.assertIn("still readable in the pane", frame)
+        self.assertNotIn("body_file", frame)
+
+    def test_a_tampered_body_file_is_refused(self) -> None:
+        frame = ab.render_frame(dict(self.META), self.big())
+        meta, _ = ab.parse_frame(frame)
+        Path(meta["body_file"]).write_text("something else entirely")
+        with self.assertRaisesRegex(ab.BridgeError, "does not match the checksum"):
+            ab.parse_frame(frame)
+
+    def test_a_missing_body_file_says_so_plainly(self) -> None:
+        frame = ab.render_frame(dict(self.META), self.big())
+        meta, _ = ab.parse_frame(frame)
+        Path(meta["body_file"]).unlink()
+        with self.assertRaisesRegex(ab.BridgeError, "gone or is not a regular file"):
+            ab.parse_frame(frame)
+
+    def test_a_pointer_outside_the_body_directory_is_refused(self) -> None:
+        outside = self.root / "planted.body"
+        outside.write_text("attacker content")
+        values = {k: self.META[k] for k in ("turn", "max", "reply_to", "server", "bridge")}
+        values["body_file"] = str(outside)
+        values["body_sha"] = ab.hashlib.sha256(b"attacker content").hexdigest()
+        fields = " ".join(f"{k}={ab.shlex.quote(v)}" for k, v in values.items())
+        digest = ab.frame_digest(values, ab.SPILL_MARKER)
+        frame = (f"{ab.FRAME_START} {fields} sum={digest}>>> {ab.SPILL_MARKER} "
+                 f"{ab.FRAME_END}")
+        with self.assertRaisesRegex(ab.BridgeError, "outside the bridge body directory"):
+            ab.parse_frame(frame)
+
+    def test_a_pointer_without_its_checksum_is_refused(self) -> None:
+        frame = ab.render_frame(dict(self.META), self.big())
+        stripped = ab.re.sub(r" body_sha=[0-9a-f]{64}", "", frame)
+        with self.assertRaisesRegex(ab.BridgeError, "integrity check"):
+            ab.parse_frame(stripped)
+
+
 # --- 2. integrity checksum ----------------------------------------------------
 
 
@@ -1840,6 +1911,60 @@ class TestIdentityReportsTheOutboundFrame(TempRoot):
         payload = ab.identity_payload(identity)
         self.assertEqual(payload["outbound_frame_file"],
                          identity["outbound_frame_file"])
+
+
+class TestSpillAndFromPaneTogether(TempRoot):
+    """The two halves of the copy fix meet here.
+
+    A long body is spilled to a file and the frame carries a pointer; the
+    receiver then reads that frame off the sender's disk instead of copying it.
+    Each was written against the same live failure, and neither is worth much if
+    the pair does not survive one round trip.
+    """
+
+    def test_a_long_body_survives_a_round_trip_with_no_copy(self) -> None:
+        body = ("a paragraph with \"quotes\", two-space indents and a backslash-n "
+                "sequence \\n in the text\n") * 40
+        sender = make_identity(self.root, "%9")
+        for name, fake in (("wait_ready", lambda target, **kw: None),
+                           ("check_abort", lambda ident: None),
+                           ("deliver", lambda target, msg: None),
+                           ("tmux_value", lambda fmt, target=None: "1")):
+            original = getattr(ab, name)
+            setattr(ab, name, fake)
+            self.addCleanup(setattr, ab, name, original)
+        meta = {"turn": "1", "max": "12", "reply_to": "%9", "server": SOCKET,
+                "bridge": "c" * 32, "bootstrap": "agent-bridge"}
+        with mock.patch.object(ab, "state_root", lambda: self.root):
+            # The real path, so the receiver's derivation is what is under test.
+            sender["outbound_frame_file"] = str(ab.outbound_frame_file(SOCKET, "%9"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                ab.send_message(sender, "%0", meta, body)
+            frame = Path(sender["outbound_frame_file"]).read_text(encoding="utf-8")
+
+            self.assertLess(len(frame), 600, "a spilled frame stays small")
+            self.assertIn("body_file=", frame)
+            self.assertEqual(frame.strip().count("\n"), 0)
+
+            receiver = make_identity(self.root, "%0")
+            args = argparse.Namespace(frame_file=None, from_pane="%9", body_out=None)
+            raw = ab.inbound_frame_text(receiver, args)
+            parsed, decoded = ab.parse_frame(raw)   # resolves the pointer itself
+            self.assertEqual(decoded, body)
+            self.assertEqual(parsed["reply_to"], "%9")
+
+    def test_a_frame_read_from_the_wrong_pane_is_refused(self) -> None:
+        """--from-pane is a transport, never a way past the address check."""
+        with mock.patch.object(ab, "state_root", lambda: self.root):
+            ab.outbound_frame_file(SOCKET, "%9").write_text(
+                ab.render_frame({"turn": "1", "max": "12", "reply_to": "%9",
+                                 "server": SOCKET, "bridge": "c" * 32}, "hi") + "\n",
+                encoding="utf-8")
+            receiver = make_identity(self.root, "%0")
+            args = argparse.Namespace(frame_file=None, from_pane="%9", body_out=None)
+            raw = ab.inbound_frame_text(receiver, args)
+        parsed, _ = ab.parse_frame(raw)
+        self.assertEqual(parsed["reply_to"], "%9")
 
 
 class TestReceiveFromPane(TempRoot):
