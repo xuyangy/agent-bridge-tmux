@@ -80,9 +80,31 @@ leaving it as a guess.
 
 ## "target %N did not reach a confirmed idle prompt"
 
-The readiness check never saw the pane both quiet and still. Real causes: the
-peer genuinely is generating; the pane is showing a scrolling log; a modal or
-pager is open.
+A busy peer is not an error. `not ready` on stderr means the helper is waiting
+and will re-check: it backs off 2s, 4s, 8s, 15s, then every 30s, for up to
+`AGENT_BRIDGE_READY_TIMEOUT` seconds (default 900). Let it run; do not kill the
+command and do not resend.
+
+The error above is raised only when that whole budget passed without the pane
+ever being both quiet and still. Real causes: the peer is generating a very long
+turn; the pane is showing a scrolling log; a modal or pager is open. If the peer
+is genuinely working a long job, re-run the same `send`/`reply` command, or raise
+`AGENT_BRIDGE_READY_TIMEOUT`.
+
+The wait is interruptible. The budget is one monotonic span that also covers the
+two captures and the 0.6s stability pause per round, so it cannot drift past what
+you asked for, and the abort sentinels are read every 2s *during* the wait — your
+`abort_command` stops a 15-minute wait at once, and stops it as a human abort,
+not as a readiness failure.
+
+Re-running is safe by construction. `wait_ready` runs before a single keystroke
+is delivered, and `send_or_release` restores the previous state on
+`PeerNotReady`, so the turn counter has not moved and no half-frame is sitting in
+the peer. This is the one delivery failure that does *not* terminate the bridge —
+observed in the wild, a not-ready peer used to leave the sender offering a reset
+and a whole new exchange, which is the expensive answer to a peer that was simply
+still thinking. Every other delivery failure still terminates, because none of
+them can promise nothing arrived.
 
 Before loosening anything, know what was already tried and rejected against real
 panes:
@@ -187,6 +209,30 @@ target whose paste rendering that check cannot read.
 
 A frame with no `sum=` field at all means the sender is running an older
 `agent_bridge.py`; update both sides to the same version.
+
+## The copy, not the wire: `receive --from-pane`
+
+Seen twice against a Codex pane, with a 3-4 KB frame. The first copy arrived with
+every `"` turned into `\"`, one backslash doubled, and every 2-space indent
+dropped — refused by the checksum. The second arrived as 16 lines, broken exactly
+where the pane wrapped, with the display's indentation baked in — refused as
+`malformed agent bridge frame (multiple lines)`. Both frames left the sender as a
+single valid line; the sender's own saved copy proves it. The receiving agent was
+rebuilding the frame from its rendered transcript, not from the text.
+
+No amount of transport hardening fixes that, because the corruption happens after
+delivery, inside the reader. So the sender writes every frame verbatim to
+`<socket-hash>-<pane>.outbound.txt` beside its log, and the receiver runs:
+
+```bash
+python3 "$SCRIPT" receive --from-pane %N --body-out body.txt
+```
+
+The path is derived from the peer's pane id and this server's socket, so nothing
+has to be passed around, and the frame's `reply_to` must match the pane named.
+Token, turn, checksum and server checks are unchanged — this replaces the copy,
+not the validation. `no frame from %N on this server` means that pane has sent
+nothing, or its helper predates the feature.
 
 ## The frame arrives split across several prompts
 

@@ -84,7 +84,15 @@ BUSY_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# Readiness is waited out, not given up on. A peer that is mid-generation is the
+# normal case, not an error: a long agent turn easily runs minutes, so a fixed
+# handful of short retries aborted bridges whose peer was simply still working.
+# The steps grow to a ceiling and then repeat until the total budget is spent.
 READY_BACKOFF = (2, 4, 8, 15, 30)
+READY_STEP_MAX = 30
+READY_TIMEOUT = float(os.environ.get("AGENT_BRIDGE_READY_TIMEOUT", "900"))
+# How often a long readiness sleep looks at the abort sentinels.
+ABORT_POLL = 2.0
 STABILITY_PAUSE = 0.6
 
 # Gap between the literal payload and Enter. Agent TUIs that coalesce fast input
@@ -613,6 +621,7 @@ def detect_identity() -> dict[str, str]:
         "state_file": str(prefix.with_suffix(".state.json")),
         "log_file": str(prefix.with_suffix(".log")),
         "abort_file": str(prefix.with_suffix(".abort")),
+        "outbound_frame_file": str(outbound_frame_file(socket, pane)),
         "global_abort_file": str(global_abort_file()),
     }
     identity.update(legacy_paths(raw_socket, socket, pane))
@@ -668,6 +677,35 @@ def identity_payload(identity: dict[str, str]) -> dict[str, Any]:
 
 
 # --- state --------------------------------------------------------------------
+
+
+def outbound_frame_file(socket: str, pane: str) -> Path:
+    """Where a pane leaves the exact bytes of the frame it last sent.
+
+    Derived from the same (socket, pane) pair as every other file, so a receiver
+    can work out its peer's path from the validated `reply_to` in the header
+    without being told it — which is the point. A UI that wraps or escapes what
+    it displays makes a hand-copied frame unusable (seen live: a 3.2 KB frame
+    re-typed from a wrapped transcript arrived as 16 lines with the indentation
+    of the display baked in), and the checksum then correctly refuses a frame
+    that was never mangled on the wire. Reading the bytes off disk removes the
+    copy from the path entirely.
+    """
+    digest = hashlib.sha256(socket.encode()).hexdigest()[:16]
+    return (state_root() / f"{digest}-{pane[1:]}").with_suffix(".outbound.txt")
+
+
+def write_outbound_frame(path: Path, frame: str) -> None:
+    """Never fatal. The frame is going out over tmux either way; this file is a
+    convenience for a receiver that cannot copy, so a disk problem here must not
+    turn a good send into a failure."""
+    try:
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(frame + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except OSError as exc:
+        print(f"agent-bridge: could not save the outbound frame: {exc}", file=sys.stderr)
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -1063,24 +1101,92 @@ def looks_ready(capture: str) -> bool:
     return not BUSY_RE.search("\n".join(lines[-TAIL_LINES:]))
 
 
-def wait_ready(target: str) -> None:
+class PeerNotReady(BridgeError):
+    """The peer pane never went idle, so NOTHING was delivered.
+
+    Separate from every other delivery failure because of what the caller may do
+    next: no keystroke reached the peer and no turn was consumed, so re-running
+    the very same command later is safe and is the correct move. A generic
+    failure cannot promise that, which is why it terminates the bridge instead.
+    """
+
+
+def ready_step(attempt: int) -> float:
+    """The wait before re-check number `attempt` (1-based), in seconds.
+
+    Grows through READY_BACKOFF and then holds at READY_STEP_MAX, so a peer on a
+    long turn is polled at a steady, cheap rate instead of an ever-growing one.
+    """
+    index = min(max(attempt, 1) - 1, len(READY_BACKOFF) - 1)
+    return min(READY_BACKOFF[index], READY_STEP_MAX)
+
+
+def sleep_watching_abort(seconds: float, identity: dict[str, str] | None) -> None:
+    """Sleep, but let a human's abort sentinel end the wait.
+
+    Sliced rather than taken in one call: the whole point of the readiness wait
+    is that it can last minutes, and a stop button that is only read once the
+    wait is over is not a stop button.
+    """
+    remaining = seconds
+    while remaining > 0:
+        if identity is not None:
+            check_abort(identity)
+        slice_ = min(ABORT_POLL, remaining)
+        time.sleep(slice_)
+        remaining -= slice_
+
+
+def wait_ready(target: str, timeout: float = READY_TIMEOUT,
+               identity: dict[str, str] | None = None) -> None:
     """Idle wording plus a still screen. Either alone is too weak: a pane can be
-    quiet mid-render, and a pane can be motionless while showing a busy line."""
+    quiet mid-render, and a pane can be motionless while showing a busy line.
+
+    A busy peer is waited out rather than aborted on: re-check until the pane
+    goes idle, a human aborts, or the deadline passes.
+
+    The deadline is one monotonic wall-clock span covering everything this
+    function does — captures, stability pauses and sleeps alike. Budgeting only
+    the sleeps let two tmux captures and a 0.6s pause per round push the real
+    wait well past what the caller asked for, and a clock that a system time
+    change can move is not a budget at all.
+    """
     if not pane_exists(target):
         raise BridgeError(f"target pane {target} does not exist on this tmux server")
-    for attempt, delay in enumerate(READY_BACKOFF, start=1):
+    deadline = time.monotonic() + max(0.0, timeout)
+    attempt = 0
+    while True:
+        attempt += 1
+        if identity is not None:
+            check_abort(identity)
+        if deadline - time.monotonic() <= 0:
+            break
         first = capture_target(target)
-        time.sleep(STABILITY_PAUSE)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(STABILITY_PAUSE, remaining))
+        if deadline - time.monotonic() <= 0:
+            break
         second = capture_target(target)
+        if deadline - time.monotonic() <= 0:
+            break
         if first == second and looks_ready(second):
             return
-        if attempt < len(READY_BACKOFF):
-            print(f"agent-bridge: {target} not ready (attempt {attempt}/"
-                  f"{len(READY_BACKOFF)}); waiting {delay}s", file=sys.stderr)
-            time.sleep(delay)
-    raise BridgeError(
-        f"target {target} did not reach a confirmed idle prompt after "
-        f"{len(READY_BACKOFF)} attempts; aborting instead of resending blindly"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if not pane_exists(target):
+            raise BridgeError(f"target pane {target} disappeared while waiting for it to go idle")
+        delay = min(ready_step(attempt), remaining)
+        print(f"agent-bridge: {target} not ready (check {attempt}); "
+              f"waiting {delay:g}s, then re-checking", file=sys.stderr)
+        sleep_watching_abort(delay, identity)
+    raise PeerNotReady(
+        f"target {target} did not reach a confirmed idle prompt within "
+        f"{timeout:g}s of waiting. Nothing was sent and no turn was used: the "
+        f"bridge is intact, so wait and run the same command again rather than "
+        f"resetting it"
     )
 
 
@@ -1301,12 +1407,22 @@ def send_or_release(identity: dict[str, str], target: str,
     partway once wrote no state at all, so a stale "pending" survived and every
     later start was refused with "this pane already has an active bridge".
     """
+    previous = load_state(identity)
     save_state(identity, {"status": "pending", "bridge": meta["bridge"],
                           "turn": int(meta["turn"]), "max": int(meta["max"]),
                           "target": target, "goal_b64": goal_b64,
                           "ack_deadline": time.time() + DEFAULT_ACK_TIMEOUT})
     try:
         return send_message(identity, target, meta, body)
+    except PeerNotReady:
+        # Nothing left this pane, so put the state back the way it was. A
+        # readiness failure used to terminate the bridge, which forced a reset
+        # and a whole new exchange over a peer that was merely still working.
+        if previous is None:
+            Path(identity["state_file"]).unlink(missing_ok=True)
+        else:
+            atomic_json(Path(identity["state_file"]), previous)
+        raise
     except BridgeError as exc:
         save_state(identity, {"status": "terminated", "reason": f"delivery failed: {exc}",
                               "bridge": meta["bridge"], "turn": int(meta["turn"])})
@@ -1504,9 +1620,16 @@ def log_inbound(identity: dict[str, str], meta: dict[str, str],
 def send_message(identity: dict[str, str], target: str, meta: dict[str, str], body: str) -> float:
     if target == identity["self_pane"]:
         raise BridgeError("refusing to bridge a pane to itself")
-    wait_ready(target)
+    # identity goes in so a human's abort sentinel ends a long readiness
+    # wait, not just the moment after it.
+    wait_ready(target, identity=identity)
     check_abort(identity)
     msg = render_frame(meta, body)
+    # Before delivery, not after: if the paste half-lands and the peer wants to
+    # check what was meant to arrive, the file has to already be there.
+    write_outbound_frame(
+        Path(identity.get("outbound_frame_file")
+             or outbound_frame_file(identity["self_socket"], identity["self_pane"])), msg)
 
     deliver(target, msg)
 
@@ -1604,6 +1727,37 @@ def command_start(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def inbound_frame_text(identity: dict[str, str], args: argparse.Namespace) -> str:
+    """The frame, either from a file the agent saved or straight off the peer's
+    disk.
+
+    --from-pane exists because the copy is the weakest link. The peer's helper
+    writes every frame it sends to a path derived from (socket, pane), so naming
+    the pane is enough to read the exact bytes — no retyping, no wrapped
+    transcript, no escaped quotes. The pane id is checked against the frame's own
+    reply_to afterwards, so a wrong pane cannot be processed as the right one.
+
+    The file is only ever a transport. Every check that matters — bridge token,
+    turn, checksum, server — still runs, so a stale or foreign file is refused
+    exactly as a mistyped frame is.
+    """
+    if getattr(args, "from_pane", None):
+        pane = args.from_pane
+        if not PANE_RE.fullmatch(pane):
+            raise BridgeError(f"invalid pane id: {pane!r}")
+        if pane == identity["self_pane"]:
+            raise BridgeError("--from-pane names this pane; a bridge has two ends")
+        path = outbound_frame_file(identity["self_socket"], pane)
+        if not path.is_file():
+            raise BridgeError(
+                f"no frame from {pane} on this server: {path}. That pane has sent "
+                f"nothing, or it is running an older agent_bridge.py that does not "
+                f"save its outbound frames"
+            )
+        return read_text_file(str(path), f"outbound frame of {pane}")
+    return read_text_file(args.frame_file, "frame file")
+
+
 def command_receive(args: argparse.Namespace) -> dict[str, Any]:
     """Validate an inbound frame, and record either way that it arrived.
 
@@ -1627,7 +1781,7 @@ def command_receive(args: argparse.Namespace) -> dict[str, Any]:
     # exactly those runs unexplained, and an unverified pane may be writing into
     # a stranger's files, which is when the basis matters most.
     log_identity_basis(identity)
-    raw = read_text_file(args.frame_file, "frame file")
+    raw = inbound_frame_text(identity, args)
     meta: dict[str, str] = {}
     try:
         check_abort(identity)
@@ -1642,6 +1796,13 @@ def command_receive(args: argparse.Namespace) -> dict[str, Any]:
     try:
         parsed, body = parse_frame(raw)
         meta = parsed
+        if getattr(args, "from_pane", None) and meta.get("reply_to") != args.from_pane:
+            # Read off disk from one pane, addressed by another. Nothing here is
+            # trustworthy enough to guess which one was meant.
+            raise BridgeError(
+                f"frame read from {args.from_pane} is addressed reply_to="
+                f"{meta.get('reply_to')!r}; refusing to process it"
+            )
         result = validate_inbound(args, identity, meta, body)
     except BridgeError as exc:
         log_inbound(identity, meta, outcome="refused", detail=log_safe_detail(exc))
@@ -1881,7 +2042,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.set_defaults(func=command_start)
 
     receive = subparsers.add_parser("receive", help="validate and decode an inbound frame")
-    receive.add_argument("--frame-file", required=True)
+    source = receive.add_mutually_exclusive_group(required=True)
+    source.add_argument("--frame-file", help="a file holding the frame exactly as it arrived")
+    source.add_argument("--from-pane", metavar="%N",
+                        help="read the frame from that pane's saved outbound file, "
+                             "for a UI whose display cannot be copied verbatim")
     receive.add_argument("--body-out", required=True)
     receive.set_defaults(func=command_receive)
 

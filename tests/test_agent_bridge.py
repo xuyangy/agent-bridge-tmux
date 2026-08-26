@@ -11,6 +11,7 @@ Run: python3 -m unittest discover -s tests
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -22,6 +23,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,7 @@ def make_identity(root: Path, pane: str) -> dict[str, str]:
         "state_file": str(prefix.with_suffix(".state.json")),
         "log_file": str(prefix.with_suffix(".log")),
         "abort_file": str(prefix.with_suffix(".abort")),
+        "outbound_frame_file": str(prefix.with_suffix(".outbound.txt")),
         "global_abort_file": str(root / "global.abort"),
         "abort_command": f"touch {prefix.with_suffix('.abort')}",
         "abort_all_command": f"touch {root / 'global.abort'}",
@@ -1295,6 +1298,116 @@ class TestBusyWordingDoesNotOverreach(unittest.TestCase):
                 self.assertFalse(ab.looks_ready(screen))
 
 
+@contextlib.contextmanager
+def fake_clock() -> Any:
+    """A clock that only sleeps move, so a 15-minute wait costs no real time.
+
+    Yields a reader for the elapsed virtual seconds, which is how these tests
+    check that the budget covers captures and pauses too, not only sleeps.
+    """
+    now = [0.0]
+
+    def sleep(seconds: float) -> None:
+        now[0] += max(0.0, seconds)
+
+    with mock.patch.object(ab.time, "sleep", sleep), \
+            mock.patch.object(ab.time, "monotonic", lambda: now[0]):
+        yield lambda: now[0]
+
+
+class TestWaitReadyKeepsRechecking(unittest.TestCase):
+    """A busy peer is normal. Waiting must keep re-checking for the whole
+    budget — one monotonic span covering captures and pauses, not only sleeps —
+    and a human's abort must be able to cut that wait short."""
+
+    def test_the_step_grows_then_holds_at_the_ceiling(self) -> None:
+        steps = [ab.ready_step(n) for n in range(1, 12)]
+        self.assertEqual(steps[:len(ab.READY_BACKOFF)], list(ab.READY_BACKOFF))
+        self.assertTrue(all(step == ab.READY_STEP_MAX
+                            for step in steps[len(ab.READY_BACKOFF):]))
+
+    def test_a_pane_that_goes_idle_late_is_still_delivered_to(self) -> None:
+        screens = ["Thinking...\n"] * 6 + ["\u276f \n"]
+        seen: list[str] = []
+
+        def capture(target: str) -> str:
+            seen.append(target)
+            return screens[min(len(seen) // 2, len(screens) - 1)]
+
+        with fake_clock() as clock, \
+                mock.patch.object(ab, "pane_exists", lambda t: True), \
+                mock.patch.object(ab, "capture_target", capture):
+            ab.wait_ready("%9", timeout=300)
+        self.assertGreater(len(seen), 4)
+        self.assertLess(clock(), 300)
+
+    def test_a_pane_busy_for_the_whole_budget_still_aborts(self) -> None:
+        with fake_clock(), \
+                mock.patch.object(ab, "pane_exists", lambda t: True), \
+                mock.patch.object(ab, "capture_target", lambda t: "Thinking...\n"):
+            with self.assertRaises(ab.PeerNotReady) as caught:
+                ab.wait_ready("%9", timeout=60)
+        self.assertIn("did not reach a confirmed idle prompt", str(caught.exception))
+
+    def test_captures_and_pauses_count_against_the_budget(self) -> None:
+        """The budget is wall-clock, not sleep-clock. Two captures plus a 0.6s
+        stability pause per round used to be spent outside it."""
+        def slow_capture(target: str) -> str:
+            ab.time.sleep(5)            # a tmux capture that is not free
+            return "Thinking...\n"
+
+        with fake_clock() as clock, \
+                mock.patch.object(ab, "pane_exists", lambda t: True), \
+                mock.patch.object(ab, "capture_target", slow_capture):
+            with self.assertRaises(ab.PeerNotReady):
+                ab.wait_ready("%9", timeout=60)
+        self.assertLess(clock(), 75, "captures must be inside the budget")
+
+    def test_a_slow_final_capture_cannot_deliver_after_the_deadline(self) -> None:
+        """A capture begun near the deadline may finish late; that result must
+        not be treated as a confirmed ready prompt."""
+        calls = 0
+
+        def capture(target: str) -> str:
+            nonlocal calls
+            calls += 1
+            ab.time.sleep(5)
+            return "❯ \n"
+
+        with fake_clock(), \
+                mock.patch.object(ab, "pane_exists", lambda t: True), \
+                mock.patch.object(ab, "capture_target", capture):
+            with self.assertRaises(ab.PeerNotReady):
+                ab.wait_ready("%9", timeout=4)
+        self.assertEqual(calls, 1)
+
+    def test_a_human_abort_ends_a_long_wait_immediately(self) -> None:
+        identity = make_identity(Path(tempfile.mkdtemp()), "%9")
+        Path(identity["abort_file"]).write_text("stop", encoding="utf-8")
+        with fake_clock(), \
+                mock.patch.object(ab, "pane_exists", lambda t: True), \
+                mock.patch.object(ab, "capture_target", lambda t: "Thinking...\n"):
+            with self.assertRaises(ab.BridgeError) as caught:
+                ab.wait_ready("%9", timeout=900, identity=identity)
+        self.assertIn("human abort signal", str(caught.exception))
+        self.assertNotIsInstance(caught.exception, ab.PeerNotReady)
+
+    def test_an_abort_pressed_mid_wait_is_seen_before_the_sleep_ends(self) -> None:
+        identity = make_identity(Path(tempfile.mkdtemp()), "%9")
+        sentinel = Path(identity["abort_file"])
+
+        def capture(target: str) -> str:
+            sentinel.write_text("stop", encoding="utf-8")   # human presses stop
+            return "Thinking...\n"
+
+        with fake_clock() as clock, \
+                mock.patch.object(ab, "pane_exists", lambda t: True), \
+                mock.patch.object(ab, "capture_target", capture):
+            with self.assertRaises(ab.BridgeError):
+                ab.wait_ready("%9", timeout=900, identity=identity)
+        self.assertLess(clock(), 60, "the sleep must be sliced, not taken whole")
+
+
 # --- 14. verifying a guessed pane against process ancestry --------------------
 
 
@@ -1606,6 +1719,161 @@ class TestIdentityBasisInTheLog(TempRoot):
         self.assertIn("identity basis", noise.getvalue())
 
 
+class TestNotReadyLeavesTheBridgeIntact(TempRoot):
+    """A peer that never went idle consumed nothing.
+
+    Terminating the bridge there forced a reset and a whole new exchange over a
+    peer that was only still working. The state must survive so the same command
+    can simply be run again.
+    """
+
+    def send(self, identity: dict[str, str], previous: dict[str, object] | None) -> None:
+        if previous is not None:
+            ab.save_state(identity, previous)
+        meta = {"turn": "3", "max": "12", "reply_to": "%9", "server": SOCKET,
+                "bridge": "c" * 32}
+
+        def not_ready(target: str, **_kw: object) -> None:
+            raise ab.PeerNotReady("target %0 did not reach a confirmed idle prompt")
+
+        original = ab.wait_ready
+        ab.wait_ready = not_ready
+        self.addCleanup(setattr, ab, "wait_ready", original)
+        with self.assertRaises(ab.PeerNotReady):
+            ab.send_or_release(identity, "%0", meta, "a body")
+
+    def test_an_awaiting_reply_bridge_is_still_repliable(self) -> None:
+        identity = make_identity(self.root, "%9")
+        previous = {"status": "awaiting_reply", "bridge": "c" * 32, "turn": 2,
+                    "max": 12, "target": "%0", "goal_b64": None}
+        self.send(identity, previous)
+        state = ab.load_state(identity)
+        self.assertEqual(state["status"], "awaiting_reply")
+        self.assertEqual(state["turn"], 2)
+
+    def test_a_first_send_leaves_the_pane_free_to_start_again(self) -> None:
+        identity = make_identity(self.root, "%9")
+        self.send(identity, None)
+        self.assertIsNone(ab.load_state(identity))
+
+    def test_other_delivery_failures_still_terminate(self) -> None:
+        identity = make_identity(self.root, "%9")
+        ab.save_state(identity, {"status": "awaiting_reply", "bridge": "c" * 32,
+                                 "turn": 2, "max": 12, "target": "%0"})
+        original = ab.send_message
+
+        def boom(*_args: object, **_kw: object) -> float:
+            raise ab.BridgeError("the frame never left the input box")
+
+        ab.send_message = boom
+        self.addCleanup(setattr, ab, "send_message", original)
+        meta = {"turn": "3", "max": "12", "reply_to": "%9", "server": SOCKET,
+                "bridge": "c" * 32}
+        with self.assertRaises(ab.BridgeError):
+            ab.send_or_release(identity, "%0", meta, "a body")
+        self.assertEqual(ab.load_state(identity)["status"], "terminated")
+
+
+class TestOutboundFrameFile(TempRoot):
+    """The copy is the weakest link in the whole transport.
+
+    A UI that wraps or escapes what it shows makes a hand-copied frame unusable,
+    and the checksum then refuses a frame that the wire never touched. The
+    sender therefore leaves the exact bytes on disk, and the receiver can name
+    the peer's pane instead of retyping anything.
+    """
+
+    def send(self, identity: dict[str, str], body: str, read: bool = True) -> str:
+        for name, fake in (("wait_ready", lambda target, **kw: None),
+                           ("check_abort", lambda ident: None),
+                           ("deliver", lambda target, msg: None),
+                           ("tmux_value", lambda fmt, target=None: "1")):
+            original = getattr(ab, name)
+            setattr(ab, name, fake)
+            self.addCleanup(setattr, ab, name, original)
+        meta = {"turn": "2", "max": "12", "reply_to": identity["self_pane"],
+                "server": SOCKET, "bridge": "c" * 32}
+        with contextlib.redirect_stdout(io.StringIO()):
+            ab.send_message(identity, "%0", meta, body)
+        if not read:
+            return ""
+        return Path(identity["outbound_frame_file"]).read_text(encoding="utf-8")
+
+    def test_the_saved_frame_is_the_frame_that_was_sent(self) -> None:
+        identity = make_identity(self.root, "%9")
+        body = "a body\nover several lines\nwith \"quotes\" and  double  spaces"
+        saved = self.send(identity, body).rstrip("\n")
+        self.assertEqual(saved.count("\n"), 0, "a frame is one line")
+        parsed, wire = ab.parse_frame(saved)
+        self.assertEqual(ab.decode_body(wire, parsed.get("enc")), body)
+
+    def test_it_is_written_even_though_delivery_is_faked(self) -> None:
+        """Written before delivery, so a half-landed paste still leaves it."""
+        identity = make_identity(self.root, "%9")
+        self.send(identity, "x")
+        self.assertTrue(Path(identity["outbound_frame_file"]).exists())
+
+    def test_a_disk_problem_does_not_fail_the_send(self) -> None:
+        identity = make_identity(self.root, "%9")
+        identity["outbound_frame_file"] = str(self.root / "no-such-dir" / "f.txt")
+        noise = io.StringIO()
+        with contextlib.redirect_stderr(noise):
+            self.send(identity, "x", read=False)          # must not raise
+        self.assertIn("outbound frame", noise.getvalue())
+
+    def test_the_path_is_derivable_from_socket_and_pane_alone(self) -> None:
+        """The receiver never gets told the path; it works it out from reply_to."""
+        with mock.patch.object(ab, "state_root", lambda: self.root):
+            path = ab.outbound_frame_file(SOCKET, "%9")
+            self.assertEqual(path, ab.outbound_frame_file(SOCKET, "%9"))
+            self.assertTrue(path.name.endswith("-9.outbound.txt"))
+            self.assertNotEqual(path, ab.outbound_frame_file(SOCKET, "%8"))
+            self.assertNotEqual(path, ab.outbound_frame_file("/other/socket", "%9"))
+
+
+class TestReceiveFromPane(TempRoot):
+    """--from-pane is a transport for the frame, never a shortcut past a check."""
+
+    def args(self, **values: object) -> Any:
+        base = {"frame_file": None, "from_pane": None, "body_out": None}
+        base.update(values)
+        return argparse.Namespace(**base)
+
+    def test_it_reads_the_peers_saved_frame(self) -> None:
+        identity = make_identity(self.root, "%9")
+        with mock.patch.object(ab, "state_root", lambda: self.root):
+            ab.outbound_frame_file(SOCKET, "%0").write_text("a frame\n", encoding="utf-8")
+            raw = ab.inbound_frame_text(identity, self.args(from_pane="%0"))
+        self.assertEqual(raw.strip(), "a frame")
+
+    def test_a_pane_that_has_sent_nothing_says_so(self) -> None:
+        identity = make_identity(self.root, "%9")
+        with mock.patch.object(ab, "state_root", lambda: self.root):
+            with self.assertRaises(ab.BridgeError) as caught:
+                ab.inbound_frame_text(identity, self.args(from_pane="%7"))
+        self.assertIn("no frame from %7", str(caught.exception))
+
+    def test_our_own_pane_is_refused(self) -> None:
+        identity = make_identity(self.root, "%9")
+        with self.assertRaises(ab.BridgeError) as caught:
+            ab.inbound_frame_text(identity, self.args(from_pane="%9"))
+        self.assertIn("two ends", str(caught.exception))
+
+    def test_a_bad_pane_id_is_refused_before_any_read(self) -> None:
+        identity = make_identity(self.root, "%9")
+        with self.assertRaises(ab.BridgeError):
+            ab.inbound_frame_text(identity, self.args(from_pane="../etc/passwd"))
+
+    def test_the_file_still_has_to_hold_a_valid_frame(self) -> None:
+        identity = make_identity(self.root, "%9")
+        with mock.patch.object(ab, "state_root", lambda: self.root):
+            ab.outbound_frame_file(SOCKET, "%0").write_text("not a frame at all\n",
+                                                            encoding="utf-8")
+            raw = ab.inbound_frame_text(identity, self.args(from_pane="%0"))
+        with self.assertRaises(ab.BridgeError):
+            ab.parse_frame(raw)
+
+
 class TestSendMessageRecordsTheBasis(TempRoot):
     """The wiring, not just the function.
 
@@ -1614,7 +1882,7 @@ class TestSendMessageRecordsTheBasis(TempRoot):
     """
 
     def send(self, identity: dict[str, str]) -> None:
-        for name, fake in (("wait_ready", lambda target: None),
+        for name, fake in (("wait_ready", lambda target, **kw: None),
                            ("check_abort", lambda ident: None),
                            ("deliver", lambda target, msg: None),
                            ("tmux_value", lambda fmt, target=None: "1")):
