@@ -241,6 +241,12 @@ name its absolute path separately.
   your own directory.** Say in your reply that the path was ambiguous and ask for
   the absolute one.
 
+Both panes must run the same `agent_bridge.py`. A receiver refuses header fields
+it does not know, so a helper predating `sender_cwd` rejects every frame from one
+that sends it — in either direction, since the reply carries the field too. If a
+bridge fails with `frame header contains unsupported fields`, the two panes are
+on different versions; fix that rather than working around it.
+
 `receive` also reports `sender_cwd`: the directory the peer's helper process was
 in when it sent the frame. It is a raw observation, stamped automatically and
 signed with the rest of the header. It is not a verified project root, not a

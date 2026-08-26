@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import stat
 import tempfile
@@ -466,6 +467,16 @@ class TestExchange(ExchangeCase):
 
 
 class TestSenderCwd(ExchangeCase):
+    def raiser(self, exc: type[Exception]):
+        def boom() -> str:
+            raise exc("no cwd")
+        return boom
+
+    def chdir(self, where: Path) -> None:
+        origin = os.getcwd()
+        os.chdir(where)
+        self.addCleanup(os.chdir, origin)
+
     def cwd_of(self, tag: str, frame: str) -> str | None:
         return self.receive(frame, tag)["sender_cwd"]
 
@@ -508,6 +519,88 @@ class TestSenderCwd(ExchangeCase):
         meta, _ = ab.parse_frame(self.wire.last)
         self.assertEqual(meta["turn"], "2")
         self.assertEqual(ab.sender_cwd_from_meta(meta), os.getcwd())
+
+    def test_an_unreadable_cwd_is_not_fatal(self) -> None:
+        # The cwd was deleted out from under the process. A cosmetic field must
+        # never be the reason a real message does not go out.
+        original = os.getcwd
+        setattr(os, "getcwd", self.raiser(OSError))
+        self.addCleanup(setattr, os, "getcwd", original)
+        self.assertEqual(ab.sender_cwd_field(), {})
+
+    def test_an_unencodable_cwd_is_not_fatal_either(self) -> None:
+        # POSIX allows path bytes that are not valid UTF-8; Python hands those
+        # back surrogate-escaped, and str.encode() refuses them. Caught too.
+        original = os.getcwd
+        setattr(os, "getcwd", lambda: "/tmp/" + chr(0xDCFF))
+        self.addCleanup(setattr, os, "getcwd", original)
+        self.assertEqual(ab.sender_cwd_field(), {})
+
+    def test_a_send_still_works_when_the_cwd_cannot_be_read(self) -> None:
+        self.as_agent(self.a)
+        original = os.getcwd
+        setattr(os, "getcwd", self.raiser(OSError))
+        self.addCleanup(setattr, os, "getcwd", original)
+        self.start("hello", max_turns=4)
+        meta, body = ab.parse_frame(self.wire.last)
+        self.assertNotIn("cwd_b64", meta)
+        self.assertEqual(body, "hello")
+        self.assertIsNone(ab.sender_cwd_from_meta(meta))
+
+    def test_start_reports_the_directory_it_was_run_from(self) -> None:
+        # Comparing against the test process's own cwd proves nothing if they
+        # are the same by accident. Move first, then look.
+        self.as_agent(self.a)
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        self.chdir(elsewhere)
+        self.start("hello", max_turns=4)
+        meta, _ = ab.parse_frame(self.wire.last)
+        self.assertEqual(ab.sender_cwd_from_meta(meta), str(elsewhere.resolve()))
+
+    def test_reply_reports_the_directory_it_was_run_from(self) -> None:
+        self.as_agent(self.a)
+        self.start("hello", max_turns=4)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        elsewhere = self.root / "b-elsewhere"
+        elsewhere.mkdir()
+        self.chdir(elsewhere)
+        self.reply("answer", "b")
+        meta, _ = ab.parse_frame(self.wire.last)
+        self.assertEqual(meta["turn"], "2")
+        self.assertEqual(ab.sender_cwd_from_meta(meta), str(elsewhere.resolve()))
+
+    def test_an_empty_cwd_field_is_refused(self) -> None:
+        # No sender emits it; the field is absent or a real path. Reporting ""
+        # would hand the reader a cwd that is not a directory.
+        with self.assertRaisesRegex(ab.BridgeError, "invalid sender cwd encoding"):
+            ab.sender_cwd_from_meta({"cwd_b64": ""})
+
+    def test_an_older_receiver_rejects_the_field_it_does_not_know(self) -> None:
+        # The rollout contract, stated as a test. parse_frame refuses header
+        # fields outside its allow-list *after* the checksum passes, so a
+        # pre-cwd receiver rejects a frame carrying cwd_b64 for exactly the
+        # reason it rejects any unknown field. Both panes must run the same
+        # version; this is the mechanism that makes that true.
+        # render_frame only emits fields it knows, so the unknown one is spliced
+        # in and the checksum recomputed — exactly what a newer sender's frame
+        # looks like to an older parser.
+        values = {"turn": "1", "max": "4", "reply_to": "%9", "server": SOCKET,
+                  "bridge": "e" * 32, "bootstrap": "agent-bridge",
+                  "invented_later": "x"}
+        header = " ".join(f"{k}={shlex.quote(v)}" for k, v in values.items())
+        header += f" sum={ab.frame_digest(values, 'hello')}"
+        frame = f"{ab.FRAME_START} {header}>>> hello {ab.FRAME_END}"
+        with self.assertRaisesRegex(ab.BridgeError, "unsupported fields"):
+            ab.parse_frame(frame)
+
+    def test_a_new_receiver_accepts_a_frame_from_an_older_sender(self) -> None:
+        # The half that does work: no field, no problem.
+        self.as_agent(self.b)
+        result = self.receive(self.frame(), "b")
+        self.assertEqual(result["action"], "process")
+        self.assertIsNone(result["sender_cwd"])
 
     def test_a_corrupt_cwd_encoding_is_refused(self) -> None:
         self.assertIsNone(ab.sender_cwd_from_meta({}))

@@ -1170,19 +1170,38 @@ def sender_cwd_field() -> dict[str, str]:
     compares the two — worktrees, subdirectories, symlink spellings and
     deliberate cross-checkout review all make them differ legitimately.
 
-    Missing when the cwd cannot be read at all, which happens if it was deleted
-    out from under the process. That is not worth failing a send over.
+    Missing when the cwd cannot be read, which happens if it was deleted out
+    from under the process, and when it cannot be encoded: POSIX allows path
+    bytes that are not valid UTF-8, and Python hands those back surrogate-
+    escaped, which str.encode() refuses. Neither is worth failing a send over —
+    a field nothing is allowed to act on must never be the reason a real message
+    does not go out.
     """
     try:
         cwd = os.getcwd()
     except OSError:
         return {}
-    return {"cwd_b64": b64url_encode(cwd)}
+    try:
+        return {"cwd_b64": b64url_encode(cwd)}
+    except UnicodeError:
+        return {}
 
 
 def sender_cwd_from_meta(meta: dict[str, str]) -> str | None:
+    """The peer's decoded cwd, or None when the frame carried none.
+
+    An empty `cwd_b64` is refused rather than reported as "". No sender emits
+    it: the field is either absent or a real path. Reporting an empty string
+    would hand the reader a cwd that is not a directory, and the raw-observation
+    posture is about not *judging* the value, not about passing through one the
+    protocol cannot produce.
+    """
     value = meta.get("cwd_b64")
-    return b64url_decode(value, "sender cwd") if value is not None else None
+    if value is None:
+        return None
+    if not value:
+        raise BridgeError("invalid sender cwd encoding")
+    return b64url_decode(value, "sender cwd")
 
 
 # --- readiness ----------------------------------------------------------------

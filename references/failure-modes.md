@@ -289,6 +289,25 @@ nothing, or its helper predates the feature.
 So a *long* frame that fails its integrity check now means the sender is running
 an older `agent_bridge.py`. Update both sides.
 
+## "frame header contains unsupported fields"
+
+The two panes are running different versions of `agent_bridge.py`.
+
+`parse_frame` refuses any header field outside its allow-list, and it does so
+*after* the checksum passes — so the frame is intact and the sender is fine; the
+receiver simply does not know one of its fields. `sender_cwd` (`cwd_b64`) is the
+first field to have caused this.
+
+It breaks in both directions, which is the part worth remembering. An old sender
+can bootstrap a new receiver, because a missing field is not an error — but the
+new receiver's reply carries `cwd_b64`, and the old sender rejects it. So the
+exchange dies on turn 2 rather than turn 1, which reads like a different bug.
+
+There is no transparent rollout for this: the old parsers are already strict.
+Upgrade both panes to the same file. If one agent is running the repo checkout
+and the other the installed skill, those are two copies and they drift — that is
+the usual cause.
+
 ## "the body file this frame points at is gone"
 
 The pointer arrived intact and the file behind it did not. Body files are swept
