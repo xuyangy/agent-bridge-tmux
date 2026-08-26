@@ -661,7 +661,8 @@ def detect_identity() -> dict[str, str]:
 
 def identity_payload(identity: dict[str, str]) -> dict[str, Any]:
     keys = ("self_pane", "self_socket", "state_file", "log_file",
-            "abort_file", "global_abort_file", "abort_command", "abort_all_command")
+            "abort_file", "outbound_frame_file", "global_abort_file",
+            "abort_command", "abort_all_command")
     payload: dict[str, Any] = {key: identity[key] for key in keys}
     # Reported only when the pane was not simply read from TMUX_PANE. The agent
     # reads this payload and repeats self_pane to a human; on the guessed path it

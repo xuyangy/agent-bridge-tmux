@@ -1831,6 +1831,17 @@ class TestOutboundFrameFile(TempRoot):
             self.assertNotEqual(path, ab.outbound_frame_file("/other/socket", "%9"))
 
 
+class TestIdentityReportsTheOutboundFrame(TempRoot):
+    """A peer on an older helper cannot derive the path, so a human has to be
+    able to read it out of the payload and hand it over."""
+
+    def test_the_payload_names_the_outbound_frame_file(self) -> None:
+        identity = make_identity(self.root, "%9")
+        payload = ab.identity_payload(identity)
+        self.assertEqual(payload["outbound_frame_file"],
+                         identity["outbound_frame_file"])
+
+
 class TestReceiveFromPane(TempRoot):
     """--from-pane is a transport for the frame, never a shortcut past a check."""
 
