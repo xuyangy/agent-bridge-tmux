@@ -602,6 +602,40 @@ class TestSenderCwd(ExchangeCase):
         self.assertEqual(result["action"], "process")
         self.assertIsNone(result["sender_cwd"])
 
+    def bad_cwd_frame(self) -> str:
+        # A frame that passes the checksum and fails only on the cwd value.
+        values = {"turn": "1", "max": "4", "reply_to": "%9", "server": SOCKET,
+                  "bridge": "f" * 32, "bootstrap": "agent-bridge",
+                  "cwd_b64": "not base64!"}
+        header = " ".join(f"{k}={shlex.quote(v)}" for k, v in values.items())
+        header += f" sum={ab.frame_digest(values, 'hello')}"
+        return f"{ab.FRAME_START} {header}>>> hello {ab.FRAME_END}"
+
+    def test_a_bad_cwd_is_refused_without_touching_state_or_disk(self) -> None:
+        # The refusal has to land before write_body_out and before any state
+        # transition. Otherwise receive tells the caller it refused the frame
+        # while leaving the pane wedged in awaiting_reply for that same turn.
+        self.as_agent(self.b)
+        body_out = self.root / "wedge-body.txt"
+        with self.assertRaisesRegex(ab.BridgeError, "invalid sender cwd encoding"):
+            ab.command_receive(types.SimpleNamespace(
+                frame_file=self.write("wedge-in.txt", self.bad_cwd_frame()),
+                body_out=str(body_out)))
+        self.assertIsNone(ab.load_state(self.b), "a refused frame must not create state")
+        self.assertFalse(body_out.exists(), "a refused frame must not write its body")
+
+    def test_a_bad_cwd_does_not_wedge_an_existing_bridge(self) -> None:
+        self.as_agent(self.a)
+        self.start("hello", max_turns=4)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        before = ab.load_state(self.b)
+        with self.assertRaisesRegex(ab.BridgeError, "invalid sender cwd encoding"):
+            ab.command_receive(types.SimpleNamespace(
+                frame_file=self.write("wedge2-in.txt", self.bad_cwd_frame()),
+                body_out=str(self.root / "wedge2-body.txt")))
+        self.assertEqual(ab.load_state(self.b), before, "state must be untouched")
+
     def test_a_corrupt_cwd_encoding_is_refused(self) -> None:
         self.assertIsNone(ab.sender_cwd_from_meta({}))
         with self.assertRaisesRegex(ab.BridgeError, "invalid sender cwd encoding"):
