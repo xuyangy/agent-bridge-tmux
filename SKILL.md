@@ -117,12 +117,17 @@ mentioned.
    string through a shell, which interpolates and can execute what it touches.
 
    ```text
+   Project: <absolute path to your project root>
+
    TASK:
    <the user's task>
 
    AGENT_A_RESULT:
    <your result>
    ```
+
+   Every actionable path in the body is absolute — see *Every path you ask the
+   peer to act on is absolute*.
 
 3. Run `start` with that body file and `TARGET_PANE`, plus `MAX_TURNS` and
    `GOAL_PHRASE` if the user gave them.
@@ -205,6 +210,36 @@ you the same decoded body either way. Two consequences worth knowing:
   fix is to ask the sender to send the turn again, never to guess at the content.
 
 A short body still travels inline, so a human watching the pane can read it.
+
+## Every path you ask the peer to act on is absolute
+
+The two agents do not share a working directory. Each pane has its own, and
+nothing in a frame tells the peer what yours is. A relative path like
+`src/api.py` therefore resolves against *their* directory, not yours. Usually it
+does not exist and the turn is wasted; worse, if they happen to sit in a
+similarly shaped tree, it resolves to a different file and neither side notices.
+Two agents in *different* projects is fine and often the point — a reviewer in
+another checkout, a service talking to its client repo — and absolute paths are
+what makes that safe.
+
+The rule covers **actionable paths**: anything you ask the peer to open, edit,
+run against, or inspect. Paths inside pasted output — a diff, a stack trace, a
+compiler diagnostic, a git pathspec, a code snippet — are evidence, not
+instructions, and stay as they came. If you want the peer to act on one of them,
+name its absolute path separately.
+
+- **In the initial message, identify the sender's project root**, as an absolute
+  path. The `Project:` line in the start template is that.
+- **Give every actionable file, directory, and log its absolute path**, in both
+  directions. A reply saying "fixed line 40" is only useful with the file's
+  absolute path next to it.
+- **An absolute path is sender-local; it may not exist for the peer.** It names
+  which file is meant, not a file the peer can necessarily open. A receiver that
+  cannot find it says so and asks — it never substitutes a similarly named local
+  file.
+- **If a peer sends you a relative actionable path, do not resolve it against
+  your own directory.** Say in your reply that the path was ambiguous and ask for
+  the absolute one.
 
 ## Replying
 
