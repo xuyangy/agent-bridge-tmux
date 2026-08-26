@@ -188,6 +188,46 @@ target whose paste rendering that check cannot read.
 A frame with no `sum=` field at all means the sender is running an older
 `agent_bridge.py`; update both sides to the same version.
 
+### When the copy is the culprit, not the transport
+
+Observed in the field, and the more common cause by far: the transport was
+perfect and the *copy* was not. A 4.2 KB one-line body was re-typed out of the
+receiving model's prompt rather than copied byte for byte. Three changes
+arrived: every `"` came back as `\"`, one `\n` became `\\n`, and every
+two-space continuation indent was dropped. 4206 characters sent, 4197 saved.
+The checksum refused it — working exactly as intended, and the turn was still
+lost.
+
+Tell these apart by the size and shape of the frame. A dropped-keystroke failure
+loses characters from the middle of a run. A bad copy shows systematic edits:
+escaped quotes, doubled backslashes, lost indentation, a re-wrapped line.
+
+The fix is structural, and it is already in place: a body over a few hundred
+characters is written to a file under the bridge state directory, and the frame
+carries `body_file=` and `body_sha=` instead of the text. The pointer sits in
+the header, so `sum=` covers it; the SHA-256 then covers the file. The frame is
+about 350 characters with no quotes, no escapes and no indentation — very little
+for a copy to get wrong — and the body never passes through a prompt at all.
+
+So a *long* frame that fails its integrity check now means the sender is running
+an older `agent_bridge.py`. Update both sides.
+
+## "the body file this frame points at is gone"
+
+The pointer arrived intact and the file behind it did not. Body files are swept
+after 24 hours, and a reboot clears the temp directory outright. Nothing was
+corrupted and nothing can be reconstructed: ask the sender to send the turn
+again. Never guess at the contents.
+
+Two neighbouring refusals, both deliberate:
+
+- *"does not match the checksum in the frame"* — the file changed after it was
+  sent. Same remedy: a resend, never a repair.
+- *"points at a body file outside the bridge body directory"* — a frame naming
+  a path elsewhere on disk is refused before it is opened. A frame is not a
+  licence to read arbitrary files, even though `sum=` proves the sender wrote
+  the path.
+
 ## The frame arrives split across several prompts
 
 An embedded newline. A literal newline delivered by `send-keys -l` is a submit in

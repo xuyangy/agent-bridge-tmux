@@ -144,6 +144,77 @@ class TestFraming(TempRoot):
         self.assertEqual(ab.goal_from_meta(parsed), "SHIP IT — done'ish \"ok\"")
 
 
+# --- 1b. long bodies travel by file -------------------------------------------
+
+
+class TestSpilledBody(TempRoot):
+    """The frame is copied by a model, so a long body must not be in it.
+
+    The field failure these cover: a 4.2 KB one-line body was re-typed rather
+    than copied, arriving with quotes escaped, a backslash doubled and every
+    continuation indent dropped. Nothing here can fix a bad copy — the checksum
+    already refuses one — so the fix is that there is nothing long left to copy.
+    """
+
+    META = {
+        "turn": "3", "max": "6", "reply_to": "%2", "server": SOCKET,
+        "bridge": "c" * 32,
+    }
+
+    def big(self) -> str:
+        return "\n".join(f'  - a finding with "quotes" and an indent, number {i}'
+                          for i in range(200))
+
+    def test_a_long_body_leaves_the_frame_short(self) -> None:
+        body = self.big()
+        frame = ab.render_frame(dict(self.META), body)
+        self.assertGreater(len(body), 4000)
+        self.assertLess(len(frame), 400, "a pointer frame must stay easy to copy")
+        self.assertIn(ab.SPILL_MARKER, frame)
+        self.assertNotIn("quotes", frame)
+        meta, decoded = ab.parse_frame(frame)
+        self.assertEqual(decoded, body)
+        self.assertEqual(meta["body_sha"], ab.hashlib.sha256(body.encode()).hexdigest())
+
+    def test_a_short_body_still_travels_inline(self) -> None:
+        frame = ab.render_frame(dict(self.META), "still readable in the pane")
+        self.assertIn("still readable in the pane", frame)
+        self.assertNotIn("body_file", frame)
+
+    def test_a_tampered_body_file_is_refused(self) -> None:
+        frame = ab.render_frame(dict(self.META), self.big())
+        meta, _ = ab.parse_frame(frame)
+        Path(meta["body_file"]).write_text("something else entirely")
+        with self.assertRaisesRegex(ab.BridgeError, "does not match the checksum"):
+            ab.parse_frame(frame)
+
+    def test_a_missing_body_file_says_so_plainly(self) -> None:
+        frame = ab.render_frame(dict(self.META), self.big())
+        meta, _ = ab.parse_frame(frame)
+        Path(meta["body_file"]).unlink()
+        with self.assertRaisesRegex(ab.BridgeError, "gone or is not a regular file"):
+            ab.parse_frame(frame)
+
+    def test_a_pointer_outside_the_body_directory_is_refused(self) -> None:
+        outside = self.root / "planted.body"
+        outside.write_text("attacker content")
+        values = {k: self.META[k] for k in ("turn", "max", "reply_to", "server", "bridge")}
+        values["body_file"] = str(outside)
+        values["body_sha"] = ab.hashlib.sha256(b"attacker content").hexdigest()
+        fields = " ".join(f"{k}={ab.shlex.quote(v)}" for k, v in values.items())
+        digest = ab.frame_digest(values, ab.SPILL_MARKER)
+        frame = (f"{ab.FRAME_START} {fields} sum={digest}>>> {ab.SPILL_MARKER} "
+                 f"{ab.FRAME_END}")
+        with self.assertRaisesRegex(ab.BridgeError, "outside the bridge body directory"):
+            ab.parse_frame(frame)
+
+    def test_a_pointer_without_its_checksum_is_refused(self) -> None:
+        frame = ab.render_frame(dict(self.META), self.big())
+        stripped = ab.re.sub(r" body_sha=[0-9a-f]{64}", "", frame)
+        with self.assertRaisesRegex(ab.BridgeError, "integrity check"):
+            ab.parse_frame(stripped)
+
+
 # --- 2. integrity checksum ----------------------------------------------------
 
 
