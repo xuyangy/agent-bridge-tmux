@@ -1461,6 +1461,35 @@ def submitted(target: str) -> bool:
     return FRAME_END not in tail and not PASTE_PLACEHOLDER_RE.search(tail)
 
 
+def frame_landed(target: str) -> bool:
+    """True once the pasted frame is visibly sitting in the target's input box.
+
+    The counterpart to submitted(), and the check that was missing. submitted()
+    reasons from absence — no delimiter, no placeholder, so it must have been
+    sent — which is only sound if the frame was ever *there*. A pane showing a
+    modal (a startup notice, a "Press enter to continue", a permission prompt)
+    is stable and says nothing busy, so wait_ready calls it idle; it then
+    discards the paste, and submitted() reads the resulting empty input box as
+    success. Observed against a freshly restarted Codex pane sitting on a usage
+    prompt: OUTBOUND was printed and logged for a frame no agent ever saw.
+
+    Positive evidence only, in the input area: the end delimiter, a paste
+    placeholder from a TUI that collapses bracketed pastes, or busy wording
+    from one that submits a paste on its own. A pane that has since exited
+    obviously consumed it.
+    """
+    result = capture_pane_text(target, history=True, check=False)
+    if result.returncode != 0:
+        # Same reasoning as submitted(): only a genuinely gone pane is evidence.
+        return not pane_exists(target)
+    clean = ANSI_RE.sub("", result.stdout)
+    lines = [line.rstrip() for line in clean.splitlines() if line.strip()]
+    if BUSY_RE.search("\n".join(lines[-TAIL_LINES:])):
+        return True
+    tail = "\n".join(lines[-INPUT_TAIL_LINES:])
+    return FRAME_END in tail or bool(PASTE_PLACEHOLDER_RE.search(tail))
+
+
 def deliver(target: str, msg: str) -> None:
     """Put the frame in the target's input box, then make sure it was submitted.
 
@@ -1485,6 +1514,21 @@ def deliver(target: str, msg: str) -> None:
     with Focus(target):
         type_into(target, msg)
         wait_settled(target)
+        if not frame_landed(target):
+            # Refuse *before* Enter. Pressing it now would not deliver anything
+            # — the text is already gone — and it is a keystroke into someone
+            # else's pane that answers whatever prompt is sitting there. In the
+            # incident that prompted this check, that Enter dismissed a startup
+            # dialog nobody asked the bridge to touch.
+            raise PeerNotReady(
+                f"the frame was pasted into {target} but never appeared in its "
+                f"input box, so that pane discarded it. Nothing was delivered "
+                f"and no turn was used. The usual cause is a modal the pane is "
+                f"sitting on — a startup notice, a usage prompt, a permission "
+                f"dialog — which looks idle to the readiness check. Clear that "
+                f"pane by hand until it shows an ordinary empty prompt, then run "
+                f"the same command again."
+            )
         press_enter(target)
 
         if SUBMIT_ATTEMPTS <= 1:

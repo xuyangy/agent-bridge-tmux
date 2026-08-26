@@ -175,6 +175,40 @@ Set attempts to `1` when the target echoes your text back — a plain `cat`, a
 dumb REPL. There an echoed frame is indistinguishable from an unsent one, so the
 confirmation raises a false alarm. Agent TUIs do not behave that way.
 
+## "never appeared in its input box, so that pane discarded it"
+
+The sibling of the section above, and the nastier half: there the frame is
+stuck somewhere you can see it, here it is simply gone.
+
+Cause: the peer pane was showing a **modal** — an agent CLI's startup notice, a
+"Press enter to continue", a usage-limit prompt, a permission dialog. Such a
+pane is perfectly stable and prints no busy wording, so `looks_ready` and the
+stability check both call it idle. It then throws the paste away, because its
+input box is not accepting text at all.
+
+What made this silent was the shape of the old submit check. `submitted()`
+reasons from *absence*: no delimiter and no paste placeholder in the input area,
+therefore the frame must have been sent. That is sound only if the frame was
+ever there. After a modal ate it, the input box is empty for the opposite
+reason, and the sender printed `OUTBOUND`, wrote the log line, and reported an
+awaiting-reply bridge for a frame no agent ever saw.
+
+`frame_landed()` closes it by demanding positive evidence between the paste and
+the Enter: the end delimiter on screen, a paste placeholder, or busy wording
+from a TUI that submits a paste by itself. Without one of those, delivery stops
+**before** Enter is pressed — deliberately, because that Enter would deliver
+nothing and would instead answer whatever dialog is sitting in someone else's
+pane. In the incident that prompted this check, it dismissed a startup dialog.
+
+The refusal is a `PeerNotReady`, so nothing was delivered, no turn was used, and
+the bridge state is put back. Clear the peer pane by hand until it shows an
+ordinary empty prompt, then **run the same command again** — do not `reset` and
+do not start a fresh bridge.
+
+Worth knowing: a pane id changes when an agent CLI is restarted. If a bridge to
+"window 7" suddenly behaves like this, re-resolve the window to a pane id before
+anything else; the agent you were talking to may no longer exist.
+
 ## "frame failed its integrity check" — or a reply that is subtly wrong
 
 Characters were dropped in transit. Seen in the field: a body containing

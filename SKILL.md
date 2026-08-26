@@ -311,6 +311,15 @@ before delivery, and the helper puts the bridge state back exactly as it was, so
 - Only after re-running has failed too — the peer is stuck, gone, or in a pager —
   is this a break, and then the section below applies.
 
+A second refusal reads `never appeared in its input box, so that pane discarded
+it`. The peer was sitting on a modal — a startup notice, a usage prompt, a
+permission dialog — which is stable and silent, so it passes every readiness
+check and then throws the paste away. Nothing was delivered and no turn was
+used, and the helper deliberately does not press Enter into that dialog. Ask the
+human to clear the pane until it shows an ordinary empty prompt, then run the
+same command again. Do not `reset` and do not open a new bridge. If the peer was
+restarted, its pane id has changed — re-resolve the window before you retry.
+
 Raise the budget with `AGENT_BRIDGE_READY_TIMEOUT=<seconds>` when the peer is
 known to be on a long job. The budget is wall-clock and covers the checks
 themselves, and the human's `abort_command` is read every couple of seconds

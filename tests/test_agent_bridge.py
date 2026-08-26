@@ -888,6 +888,107 @@ class TestTimeouts(TempRoot):
 # --- 5. the submit check -----------------------------------------------------
 
 
+class TestFrameLanded(unittest.TestCase):
+    """The gap that let a frame vanish: a pane sitting on a modal looks idle,
+    swallows the paste, and then reads as an empty input box — which submitted()
+    scored as success. frame_landed() demands positive evidence instead."""
+
+    def pane(self, screen: str, *, alive: bool = True) -> bool:
+        original_run, original_exists = ab.run_tmux, ab.pane_exists
+        setattr(ab, "run_tmux",
+                lambda *_a, **_k: types.SimpleNamespace(returncode=0, stdout=screen))
+        setattr(ab, "pane_exists", lambda *_a, **_k: alive)
+        try:
+            return ab.frame_landed("%2")
+        finally:
+            setattr(ab, "run_tmux", original_run)
+            setattr(ab, "pane_exists", original_exists)
+
+    def test_the_visible_frame_counts_as_landed(self) -> None:
+        self.assertTrue(self.pane(f"> {ab.FRAME_START} turn=1 >>> body {ab.FRAME_END}\n"))
+
+    def test_a_paste_placeholder_counts_as_landed(self) -> None:
+        self.assertTrue(self.pane("> [Pasted text #1 +42 lines]\n"))
+
+    def test_a_busy_pane_counts_as_landed(self) -> None:
+        # Some TUIs submit a bracketed paste on their own; by the time we look,
+        # the box is empty because the agent is already working.
+        self.assertTrue(self.pane("Thinking...\n(esc to interrupt)\n"))
+
+    def test_an_empty_prompt_means_the_paste_was_discarded(self) -> None:
+        # The exact reading submitted() gets right only *after* the frame has
+        # been seen. On its own it is the false success this check exists for.
+        self.assertFalse(self.pane("assistant output above\n\n> \n"))
+
+    def test_a_modal_that_ate_the_paste_is_not_landed(self) -> None:
+        # The observed incident: a restarted agent CLI on a startup prompt.
+        screen = ("  1. Yes\n  2. No, quit\n  Press enter to continue\n"
+                  "> Ask Codex to do anything\n")
+        self.assertFalse(self.pane(screen))
+
+    def test_a_dead_pane_counts_as_landed(self) -> None:
+        original_run, original_exists = ab.run_tmux, ab.pane_exists
+        setattr(ab, "run_tmux",
+                lambda *_a, **_k: types.SimpleNamespace(returncode=1, stdout=""))
+        setattr(ab, "pane_exists", lambda *_a, **_k: False)
+        self.addCleanup(setattr, ab, "run_tmux", original_run)
+        self.addCleanup(setattr, ab, "pane_exists", original_exists)
+        self.assertTrue(ab.frame_landed("%2"))
+
+    def test_a_capture_hiccup_on_a_live_pane_is_not_landed(self) -> None:
+        original_run, original_exists = ab.run_tmux, ab.pane_exists
+        setattr(ab, "run_tmux",
+                lambda *_a, **_k: types.SimpleNamespace(returncode=1, stdout=""))
+        setattr(ab, "pane_exists", lambda *_a, **_k: True)
+        self.addCleanup(setattr, ab, "run_tmux", original_run)
+        self.addCleanup(setattr, ab, "pane_exists", original_exists)
+        self.assertFalse(ab.frame_landed("%2"))
+
+
+class TestDeliverRefusesADiscardedPaste(unittest.TestCase):
+    """deliver() must not press Enter into a pane that never took the frame.
+    Enter there delivers nothing and answers whatever dialog is on screen."""
+
+    def setUp(self) -> None:
+        self.enters = 0
+        original_type, original_settle = ab.type_into, ab.wait_settled
+        original_enter, original_landed = ab.press_enter, ab.frame_landed
+        original_focus = ab.Focus
+        setattr(ab, "type_into", lambda *_a, **_k: None)
+        setattr(ab, "wait_settled", lambda *_a, **_k: None)
+        setattr(ab, "press_enter", lambda *_a, **_k: self.count())
+        setattr(ab, "Focus", lambda *_a, **_k: contextlib.nullcontext())
+        for name, value in (("type_into", original_type), ("wait_settled", original_settle),
+                            ("press_enter", original_enter), ("frame_landed", original_landed),
+                            ("Focus", original_focus)):
+            self.addCleanup(setattr, ab, name, value)
+
+    def count(self) -> None:
+        self.enters += 1
+
+    def test_a_discarded_paste_raises_before_enter(self) -> None:
+        setattr(ab, "frame_landed", lambda *_a, **_k: False)
+        with self.assertRaisesRegex(ab.BridgeError, "never appeared in its input box"):
+            ab.deliver("%2", "frame")
+        self.assertEqual(self.enters, 0, "Enter must not reach a pane showing a dialog")
+
+    def test_it_is_a_peer_not_ready_so_the_bridge_survives(self) -> None:
+        # Nothing was delivered and no turn was used, so the caller may re-run
+        # the identical command. Only PeerNotReady carries that promise.
+        setattr(ab, "frame_landed", lambda *_a, **_k: False)
+        with self.assertRaises(ab.PeerNotReady):
+            ab.deliver("%2", "frame")
+
+    def test_a_landed_frame_still_gets_its_enter(self) -> None:
+        original_submitted = ab.submitted
+        self.addCleanup(setattr, ab, "submitted", original_submitted)
+        setattr(ab, "frame_landed", lambda *_a, **_k: True)
+        setattr(ab, "submitted", lambda *_a, **_k: True)
+        ab.deliver("%2", "frame")
+        self.assertGreaterEqual(self.enters, 1)
+
+
+
 class TestSubmitted(unittest.TestCase):
     """The false-success path. If submitted() wrongly returns True, the bridge
     reports a delivered frame that is in fact still sitting in the input box."""
