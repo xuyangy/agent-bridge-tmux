@@ -1611,6 +1611,38 @@ class TestLegacyGlobalSentinel(ExchangeCase):
         ab.command_clear_abort(types.SimpleNamespace(all=True))
         self.assertFalse(old.exists())
 
+    def test_it_is_watched_even_when_absent_at_startup(self) -> None:
+        """The docs tell a human to touch this path. They may do it mid-send,
+        while the process is already sitting in wait_ready polling a busy peer,
+        so existence must be re-tested, not frozen at identity time."""
+        old = self.root / "old-global.stop"
+        self.a["legacy_global_abort_file"] = str(old)
+        ab.check_abort(self.a)  # absent: no refusal
+        old.touch()
+        with self.assertRaises(ab.BridgeError) as caught:
+            ab.check_abort(self.a)
+        self.assertIn(str(old), str(caught.exception))
+
+    def test_it_is_not_reported_while_absent(self) -> None:
+        self.a["legacy_global_abort_file"] = str(self.root / "old-global.stop")
+        self.assertNotIn("legacy_global_abort_file", ab.identity_payload(self.a))
+
+    def test_status_reports_it_as_a_present_sentinel(self) -> None:
+        old = self.root / "old-global.stop"
+        old.touch()
+        self.a["legacy_global_abort_file"] = str(old)
+        result = ab.command_status(types.SimpleNamespace())
+        self.assertIn(str(old), result["abort_sentinels_present"])
+        self.assertEqual(result["legacy_global_abort_file"], str(old))
+
+    def test_reset_does_not_call_the_pane_ready_while_it_is_set(self) -> None:
+        old = self.root / "old-global.stop"
+        old.touch()
+        self.a["legacy_global_abort_file"] = str(old)
+        result = ab.command_reset(types.SimpleNamespace(all=False))
+        self.assertFalse(result["ready_for_new_bridge"])
+        self.assertTrue(result["global_abort_still_present"])
+
     def test_clear_abort_without_all_leaves_it(self) -> None:
         old = self.root / "old-global.stop"
         old.touch()

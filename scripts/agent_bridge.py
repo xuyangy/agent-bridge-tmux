@@ -32,7 +32,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 FRAME_START = "<<<AGENT_MSG"
 FRAME_END = "<<<END_AGENT_MSG>>>"
@@ -625,12 +625,14 @@ def detect_identity() -> dict[str, str]:
         "global_abort_file": str(global_abort_file()),
     }
     identity.update(legacy_paths(raw_socket, socket, pane))
-    # The pre-move global sentinel. Someone may have stopped every bridge with the
-    # old command minutes ago; moving the file is no reason to start them again.
+    # The pre-move global sentinel, recorded as a path to watch rather than as a
+    # file seen once. Someone may have stopped every bridge with the old command
+    # minutes ago, and moving the file is no reason to start them again -- but
+    # they may equally type it mid-send, while this process is sitting in
+    # wait_ready polling a busy peer. Testing existence here would freeze that
+    # answer for the life of the process; every reader below re-tests it instead.
     identity["legacy_global_abort_file"] = (
-        str(LEGACY_GLOBAL_ABORT)
-        if LEGACY_GLOBAL_ABORT != global_abort_file() and LEGACY_GLOBAL_ABORT.exists()
-        else "")
+        str(LEGACY_GLOBAL_ABORT) if LEGACY_GLOBAL_ABORT != global_abort_file() else "")
     # Two buttons, deliberately not one. With several bridges running at once —
     # panes 1↔2 and 3↔4, say — the command printed every turn must stop only the
     # bridge the human is watching. `abort_command` is therefore the per-pane
@@ -671,9 +673,14 @@ def identity_payload(identity: dict[str, str]) -> dict[str, Any]:
     # is unchanged.
     if identity.get("pane_basis", BASIS_ENV) != BASIS_ENV:
         payload["pane_basis"] = identity["pane_basis"]
-    for key in ("legacy_state_file", "legacy_abort_file", "legacy_global_abort_file"):
+    for key in ("legacy_state_file", "legacy_abort_file"):
         if identity.get(key):
             payload[key] = identity[key]
+    # Reported only while it is really there. The path is always watched now, and
+    # naming a file that does not exist would read as a second stop button a human
+    # is meant to go and clear.
+    if global_abort_present(identity) == identity.get("legacy_global_abort_file"):
+        payload["legacy_global_abort_file"] = identity["legacy_global_abort_file"]
     return payload
 
 
@@ -764,6 +771,20 @@ def expire_stale(identity: dict[str, str],
     state["status"] = "timed_out"
     save_state(identity, state)
     return state
+
+
+def global_abort_present(identity: dict[str, str]) -> str:
+    """The global sentinel that is set right now, current path or legacy, or "".
+
+    Callers report "every bridge is stopped" from this rather than from the
+    current path alone: the legacy path stops a send just as hard, so answering
+    only for the new one tells a human the bridge is ready when it is not.
+    """
+    for key in ("global_abort_file", "legacy_global_abort_file"):
+        raw = identity.get(key) or ""
+        if raw and Path(raw).exists():
+            return raw
+    return ""
 
 
 def check_abort(identity: dict[str, str]) -> None:
@@ -1617,7 +1638,7 @@ def send_or_release(identity: dict[str, str], target: str,
         raise
 
 
-def open_log(path: Path) -> Any:
+def open_log(path: Path) -> TextIO:
     """Append to the log, created 0600, and tightened if it is not.
 
     The `.json` files are chmod 0600 explicitly; the log was only ever whatever
@@ -2137,7 +2158,8 @@ def command_status(_: argparse.Namespace) -> dict[str, Any]:
     identity = detect_identity()
     state = expire_stale(identity, load_state(identity))
     aborted = [p for p in (identity["global_abort_file"], identity["abort_file"],
-                           identity.get("legacy_abort_file") or "")
+                           identity.get("legacy_abort_file") or "",
+                           identity.get("legacy_global_abort_file") or "")
                if p and Path(p).exists()]
     expires = state_deadline(state)
     stranded = legacy_bridge_is_live(identity)
@@ -2174,7 +2196,7 @@ def clear_sentinels(identity: dict[str, str], *, include_global: bool) -> list[s
 def command_clear_abort(args: argparse.Namespace) -> dict[str, Any]:
     identity = detect_identity()
     removed = clear_sentinels(identity, include_global=getattr(args, "all", False))
-    global_present = Path(identity["global_abort_file"]).exists()
+    global_present = bool(global_abort_present(identity))
     return {"removed": removed,
             "global_abort_still_present": global_present,
             "note": ("the global sentinel stops every bridge and is still set; "
@@ -2215,7 +2237,7 @@ def command_reset(args: argparse.Namespace) -> dict[str, Any]:
                      "bridge": stranded.get("bridge"), "turn": stranded.get("turn"),
                      "updated_at": time.time()})
     removed = clear_sentinels(identity, include_global=getattr(args, "all", False))
-    blocked_by_global = Path(identity["global_abort_file"]).exists()
+    blocked_by_global = bool(global_abort_present(identity))
     return {"released": previous, "released_legacy": stranded,
             "abort_sentinels_removed": removed,
             "ready_for_new_bridge": not blocked_by_global,

@@ -378,9 +378,11 @@ The peer's reply is the acknowledgement. On timeout, abort and report.
 
 ## The loop will not stop
 
-Two sentinels are checked before every send: the global one (default
-`/tmp/agent-bridge.stop`, override with `AGENT_BRIDGE_ABORT`) and a per-pane one
-printed by `identity` as `abort_command`. Either stops the pane from sending.
+Two sentinels are checked before every send, and again while a send waits for a
+busy peer: the global one (default `<state root>/global.stop`, printed by
+`identity` as `abort_all_command`, override with `AGENT_BRIDGE_ABORT`) and a
+per-pane one printed as `abort_command`. Either stops the pane from sending.
+The old global path `/tmp/agent-bridge.stop` is still honoured as a fallback.
 
 If sends continue after a sentinel exists, an agent is calling `tmux send-keys`
 directly instead of going through the helper. That is the bug.
