@@ -131,6 +131,9 @@ Knobs, if your setup needs them:
 | --- | --- | --- |
 | `AGENT_BRIDGE_SUBMIT_DELAY` | `0.8` | wait before the first Enter; raise for a slow TUI |
 | `AGENT_BRIDGE_SUBMIT_ATTEMPTS` | `4` | total Enter presses; `1` disables the check |
+| `AGENT_BRIDGE_INPUT_TAIL` | `5` | how many bottom lines count as the input box; raise if the target has a thick status bar |
+| `AGENT_BRIDGE_READY_TIMEOUT` | `900` | seconds to wait for a busy peer to go idle before giving up |
+| `AGENT_BRIDGE_FOCUS` | `notify` | tells the target pane it has focus, so a TUI that holds unfocused keystrokes accepts them; nothing moves on screen. `off` skips it |
 
 Use `1` only when the target is not an agent TUI — a plain `cat` or a dumb REPL
 echoes your text back, which looks identical to an unsent frame and trips a
@@ -147,6 +150,14 @@ The default transport (`AGENT_BRIDGE_TYPE=paste`) hands the frame over as one
 atomic paste, so there are no keystrokes to drop. If you have set
 `AGENT_BRIDGE_TYPE=type`, put it back to `paste`.
 
+`type` is the old path: it sends small paced chunks. Two knobs shape it, and both
+do nothing in `paste` mode:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AGENT_BRIDGE_CHUNK` | `8` | characters per chunk |
+| `AGENT_BRIDGE_CHUNK_PAUSE` | `0.08` | seconds between chunks; raise if characters get dropped |
+
 The other cause is the copy, not the transport: the receiving agent re-types the
 frame out of its prompt instead of saving it byte for byte, and escapes quotes
 or drops indentation on the way. So a body over a few hundred characters is
@@ -160,7 +171,7 @@ This is automatic; both sides just need the same version of the script.
 python3 -m unittest discover -s tests
 ```
 
-236 tests, no dependencies, no tmux server needed — they stub the transport and
+240 tests, no dependencies, no tmux server needed — they stub the transport and
 check framing, the integrity checksum, the state machine, turn bounds, timeouts,
 and the submit check. They do not prove delivery; that part is checked against a
 real pane by hand.
