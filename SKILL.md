@@ -99,9 +99,11 @@ case left where your files are keyed to a guess, which makes it more worth actin
 on, not less. An agent that has called `setsid`, or otherwise lost its terminal,
 still resolves correctly; only one orphaned from its parent falls back.
 
-Print the returned `abort_command` to the user **every turn**. The helper checks
-the sentinels immediately before every send, but the human needs the command in
-front of them to use it.
+Print the returned `abort_command` to the user **once, when the bridge starts**,
+and again whenever you report a problem — a refused send, a wedged pane, a
+missed ack. The helper checks the sentinels immediately before every send, so
+the button always works; repeating the path on every turn is noise the human
+has already read.
 
 `abort_command` stops **this bridge only**. `abort_all_command` stops every
 bridge on the machine. Print the first one; mention the second only if the user
@@ -321,8 +323,8 @@ argument exists. The helper replies to the validated `reply_to`, stamps
 your own cached pane and socket, carries the bridge token and goal phrase
 forward, increments the turn, and refuses to exceed `max`.
 
-Report the `OUTBOUND` line, the abort command, and the ack deadline, then end
-your turn so the peer can answer.
+Report the `OUTBOUND` line and the ack deadline, then end your turn so the peer
+can answer. Do not repeat the abort command here unless something went wrong.
 
 ## Stopping
 

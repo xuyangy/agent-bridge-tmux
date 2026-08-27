@@ -43,8 +43,9 @@ A good first test, small enough to watch end to end:
 
 Two buttons, because you may have more than one bridge running.
 
-**Stop this one.** The agent prints this command every turn, so it is always in
-front of you. The path ends in `.abort` and names the pane:
+**Stop this one.** The agent prints this command when the bridge starts, and
+again whenever it reports a problem. The path ends in `.abort` and names the
+pane:
 
 ```bash
 touch /var/folders/.../agent-bridge-<uid>/<hash>-<pane>.abort
