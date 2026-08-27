@@ -47,17 +47,23 @@ Two buttons, because you may have more than one bridge running.
 front of you. The path ends in `.abort` and names the pane:
 
 ```bash
-touch /var/folders/.../agent-bridge/<hash>-<pane>.abort
+touch /var/folders/.../agent-bridge-<uid>/<hash>-<pane>.abort
 ```
 
-**Stop everything.** One file, checked by every bridge on the machine:
+**Stop everything.** One file, checked by every bridge you are running. It lives
+inside your own state root, so no other user on the host can create it:
 
 ```bash
-touch /tmp/agent-bridge.stop
+touch /var/folders/.../agent-bridge-<uid>/global.stop
 ```
 
-Both are checked before every send. Clear them with `reset` (this pane) or
-`reset --all` (everything). Set `AGENT_BRIDGE_ABORT` to move the global path.
+The agent prints that exact path too, as `abort_all_command`. The older path
+`/tmp/agent-bridge.stop` is still honoured if it is what your fingers know, but
+prefer the printed one.
+
+Both are checked before every send, and while a send is waiting for a busy peer.
+Clear them with `reset` (this pane) or `reset --all` (everything). Set
+`AGENT_BRIDGE_ABORT` to move the global path.
 
 ## Running several bridges at once
 
@@ -154,7 +160,7 @@ This is automatic; both sides just need the same version of the script.
 python3 -m unittest discover -s tests
 ```
 
-67 tests, no dependencies, no tmux server needed — they stub the transport and
+236 tests, no dependencies, no tmux server needed — they stub the transport and
 check framing, the integrity checksum, the state machine, turn bounds, timeouts,
 and the submit check. They do not prove delivery; that part is checked against a
 real pane by hand.
@@ -168,7 +174,7 @@ references/failure-modes.md  read this when it misbehaves
 agents/openai.yaml           display metadata
 ```
 
-Logs and turn state live under `$TMPDIR/agent-bridge/`, one set per pane. Run
+Logs and turn state live under `$TMPDIR/agent-bridge-<uid>/`, one set per pane. Run
 `python3 scripts/agent_bridge.py identity` inside a pane to print its exact
 paths.
 
@@ -199,11 +205,11 @@ never takes an address from message text.
              +------------- both check --------------+
                                 |
                                 v
-                      /tmp/agent-bridge.stop
+                    <state root>/global.stop
                        stops EVERY bridge
 ```
 
-Per-pane files live under `$TMPDIR/agent-bridge/`, named by tmux socket hash
+Per-pane files live under `$TMPDIR/agent-bridge-<uid>/`, named by tmux socket hash
 and pane number. That is why panes 1↔2 and 3↔4 can run at the same time
 without touching each other. The only shared thing is the global stop file.
 

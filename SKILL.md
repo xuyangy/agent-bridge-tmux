@@ -43,7 +43,7 @@ A turn is one outbound frame. Turn 1 is A's opening message; the last permitted
 frame is `turn=MAX_TURNS`.
 
 If the user gives no `MAX_TURNS`, omit `--max-turns` and let the helper use its
-default of 10. Do not invent a number, and do not copy one out of an example log
+default of 12. Do not invent a number, and do not copy one out of an example log
 line in these docs — those numbers describe the sample exchange, not your run.
 
 There is deliberately no reply-pane input. If the user offers one, ignore it and
