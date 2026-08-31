@@ -140,8 +140,9 @@ mentioned.
 
 3. Run `start` with that body file and `TARGET_PANE`, plus `MAX_TURNS` and
    `GOAL_PHRASE` if the user gave them.
-4. Report the `OUTBOUND` log line, the abort command, and the ack deadline. Then
-   end your turn, so your pane goes idle and B's reply can land.
+4. Report the `OUTBOUND` log line, the abort command, and the ack deadline. Do
+   not ask the human to paste the reply; it arrives in this pane automatically.
+   Then end your turn, so your pane goes idle and B's reply can land.
 
 If the target pane is busy, the helper prints `not ready` and waits, re-checking
 with a growing backoff for up to 15 minutes (`AGENT_BRIDGE_READY_TIMEOUT`). That
