@@ -96,6 +96,15 @@ unstick this.
 `status` tells you which case you are in: `start_blocked` and
 `expires_in_seconds`.
 
+## Locale warnings on macOS
+
+If bridge commands print `bash: warning: setlocale` about `C.UTF-8`, the agent's
+command environment uses a locale macOS does not provide. The skill specifies
+zsh and a supported UTF-8 locale for macOS commands, including Python shims.
+See [the troubleshooting steps](references/failure-modes.md#bash-warning-setlocale-on-macos)
+for a check that sends no messages. An already-running agent may need to reread
+the updated skill to use these launch settings.
+
 ## What stops a bridge
 
 - the turn limit is reached — hard; no frame goes out past it

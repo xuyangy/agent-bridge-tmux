@@ -60,6 +60,27 @@ tmux list-panes -a -F '#{pane_id} #{session_name}:#{window_index} #{window_name}
 Never infer a target from task text. Typing into the wrong pane interrupts a
 human or an unrelated agent.
 
+## Shell launch on macOS
+
+For every bridge helper or tmux command on macOS, select `/bin/zsh` as the
+execution tool's outer shell and disable login mode (Codex `exec_command`:
+`shell="/bin/zsh", login=false`). Prefix the command with
+`/usr/bin/env LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 LC_CTYPE=en_US.UTF-8`:
+
+```sh
+/usr/bin/env LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 LC_CTYPE=en_US.UTF-8 python3 "$SCRIPT" identity
+```
+
+Use the same launch settings and prefix for subsequent commands, including
+`status`. macOS does not provide `C.UTF-8`; an inherited value can make Bash
+warn before Python starts, including inside a `python3` version-manager shim.
+Setting the locale inside Python is too late. The prefix fixes child processes;
+selecting zsh at the tool level also avoids launching an outer Bash with the
+invalid locale. Running `zsh -c` *inside* an already-started Bash is too late too.
+For tools without shell selection, set a supported locale in the tool's launch
+environment before it starts Bash. See [locale warnings](references/failure-modes.md#bash-warning-setlocale-on-macos)
+if warnings persist. Keep the normal launch on other platforms.
+
 ## Commands
 
 Resolve `scripts/agent_bridge.py` relative to this `SKILL.md` — the skill may be

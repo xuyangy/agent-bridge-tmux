@@ -3,6 +3,30 @@
 Read this when the bridge behaves oddly. The symptoms look alike from the inside;
 the causes do not. Each entry names the symptom first.
 
+## Bash warning: setlocale on macOS
+
+`bash: warning: setlocale: LC_ALL: cannot change locale (C.UTF-8)` means a
+shell inherited a locale that macOS does not provide. Check `locale -a` for
+available names; `en_US.UTF-8` is available on macOS. This warning can appear
+before the helper runs, including from Bash-based Python version-manager shims.
+The helper invokes tmux directly and cannot repair its parent shell's startup.
+
+Use the [macOS shell launch settings](../SKILL.md#shell-launch-on-macos): select
+`/bin/zsh` with login mode disabled in the execution tool, and prefix every
+helper invocation with the three locale assignments shown there. Both parts
+matter: the prefix reaches Python shims and other children, but cannot silence
+an outer Bash that has already started. Do not hide stderr, since it also carries
+bridge failures.
+
+To check without sending messages or changing bridge state, use that invocation
+with `python3 "$SCRIPT" --help`. It should return help with no locale warnings.
+If the tool cannot select zsh, correct the locale in its launch environment and
+restart the affected agent, then verify the actual command environment. A config
+file saying `en_US.UTF-8` does not prove a running session inherited it.
+
+A separate `ack timeout exceeded` is still a bridge timeout; fixing locale
+warnings does not resume the exchange or authorize resending a frame.
+
 ## Messages vanish; peer never replies; no error anywhere
 
 Almost always a **cross-server** bridge. Pane ids are per-server, and
