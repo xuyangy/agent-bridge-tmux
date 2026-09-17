@@ -96,6 +96,14 @@ unstick this.
 `status` tells you which case you are in: `start_blocked` and
 `expires_in_seconds`.
 
+## Starting over with a fresh bridge
+
+Tell either agent you want a "fresh bridge" or a "new bridge". The agent that
+opens it runs `start --fresh`. That ends the old bridge in its own pane and
+marks the new frame as fresh. The other pane then drops its old bridge with
+that same peer and takes the new one. A fresh frame from any other pane is
+still refused, and an abort file still stops everything.
+
 ## Locale warnings on macOS
 
 If bridge commands print `bash: warning: setlocale` about `C.UTF-8`, the agent's
@@ -181,7 +189,7 @@ This is automatic; both sides just need the same version of the script.
 python3 -m unittest discover -s tests
 ```
 
-240 tests, no dependencies, no tmux server needed — they stub the transport and
+247 tests, no dependencies, no tmux server needed — they stub the transport and
 check framing, the integrity checksum, the state machine, turn bounds, timeouts,
 and the submit check. They do not prove delivery; that part is checked against a
 real pane by hand.

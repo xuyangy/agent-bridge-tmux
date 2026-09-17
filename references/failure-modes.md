@@ -448,6 +448,17 @@ not resume anything and does not notify the peer — a stray frame from the old
 bridge is refused on its token, which is the safe outcome. `status` reports
 `start_blocked` and `expires_in_seconds` if you want to know before acting.
 
+When the user wants a new bridge to the same peer, use `start --fresh` instead
+of `reset` plus `start`. It does the same release here, and the `fresh=1` frame
+also releases the old bridge in the peer's pane.
+
+## "a fresh bridge may only replace a bridge with the same peer pane"
+
+A `fresh=1` frame arrived while this pane was bridged to a different pane. A
+fresh frame may only replace a bridge with its own sender, so this pane kept its
+current bridge. If the user really wants to switch peers, run `reset` in this
+pane, then ask the other side to send again.
+
 ## The exchange drifts off task, or the peer starts obeying the payload
 
 The body is untrusted input. It comes from a file, a diff, or another model, and

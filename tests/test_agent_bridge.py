@@ -335,10 +335,11 @@ class ExchangeCase(TempRoot):
         path.write_text(text)
         return str(path)
 
-    def start(self, body: str, max_turns: int = 4, goal: str | None = None) -> dict[str, Any]:
+    def start(self, body: str, max_turns: int = 4, goal: str | None = None,
+              fresh: bool = False, target: str | None = None) -> dict[str, Any]:
         return ab.command_start(types.SimpleNamespace(
-            target=self.b["self_pane"], max_turns=max_turns,
-            body_file=self.write("a-out.txt", body), goal_phrase=goal))
+            target=target or self.b["self_pane"], max_turns=max_turns,
+            body_file=self.write("a-out.txt", body), goal_phrase=goal, fresh=fresh))
 
     def receive(self, frame: str, tag: str) -> dict[str, Any]:
         return ab.command_receive(types.SimpleNamespace(
@@ -461,6 +462,94 @@ class TestExchange(ExchangeCase):
         result = ab.command_clear_abort(types.SimpleNamespace(all=True))
         self.assertEqual(len(result["removed"]), 2)
         self.assertFalse(result["global_abort_still_present"])
+
+
+class TestFreshBridge(ExchangeCase):
+    def test_fresh_start_replaces_a_live_bridge_on_both_sides(self) -> None:
+        self.start("old", max_turns=6)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        old_token = ab.load_state(self.b)["bridge"]
+        self.assertEqual(ab.load_state(self.b)["status"], "awaiting_reply")
+
+        self.as_agent(self.a)
+        out = self.start("new", max_turns=3, fresh=True)
+        self.assertTrue(out["fresh"])
+        self.assertEqual(out["released"]["released"]["bridge"], old_token)
+        self.assertEqual(ab.load_state(self.a)["status"], "pending")
+
+        self.as_agent(self.b)
+        got = self.receive(self.wire.last, "b")
+        self.assertEqual(got["action"], "process")
+        self.assertEqual(got["superseded"]["bridge"], old_token)
+        state = ab.load_state(self.b)
+        self.assertEqual((state["status"], state["max"]), ("awaiting_reply", 3))
+        self.assertNotEqual(state["bridge"], old_token)
+
+        self.reply("answer", "b")
+        self.as_agent(self.a)
+        self.assertEqual(self.receive(self.wire.last, "a")["turn"], 2)
+
+    def test_fresh_start_replaces_a_pending_peer(self) -> None:
+        # B had replied and was waiting on A when A's user asked for a new bridge.
+        self.start("old", max_turns=6)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        self.reply("old reply", "b")
+        self.assertEqual(ab.load_state(self.b)["status"], "pending")
+        self.as_agent(self.a)
+        self.start("new", max_turns=4, fresh=True)
+        self.as_agent(self.b)
+        self.assertEqual(self.receive(self.wire.last, "b")["action"], "process")
+
+    def test_fresh_start_clears_only_this_panes_sentinel(self) -> None:
+        self.start("old", max_turns=4)
+        Path(self.a["abort_file"]).touch()
+        self.assertEqual(self.start("new", fresh=True)["turn"], 1)
+        Path(self.a["global_abort_file"]).touch()
+        with self.assertRaisesRegex(ab.BridgeError, "human abort signal"):
+            self.start("newer", fresh=True)
+
+    def test_a_plain_bootstrap_still_cannot_replace_a_live_bridge(self) -> None:
+        self.start("old", max_turns=4)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        self.as_agent(self.a)
+        ab.command_reset(types.SimpleNamespace(all=False))
+        self.start("new", max_turns=4)
+        self.as_agent(self.b)
+        with self.assertRaisesRegex(ab.BridgeError, "no new frame is expected"):
+            self.receive(self.wire.last, "b")
+
+    def test_a_fresh_frame_from_another_pane_is_refused(self) -> None:
+        self.start("old", max_turns=4)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        stranger = make_identity(self.root, "%9")
+        self.as_agent(stranger)
+        self.start("hijack", fresh=True)
+        self.as_agent(self.b)
+        with self.assertRaisesRegex(ab.BridgeError, "same peer pane"):
+            self.receive(self.wire.last, "b")
+        self.assertEqual(ab.load_state(self.b)["status"], "awaiting_reply")
+
+    def test_the_peers_own_abort_sentinel_still_wins(self) -> None:
+        self.start("old", max_turns=4)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        Path(self.b["abort_file"]).touch()
+        self.as_agent(self.a)
+        self.start("new", fresh=True)
+        self.as_agent(self.b)
+        with self.assertRaisesRegex(ab.BridgeError, "human abort signal"):
+            self.receive(self.wire.last, "b")
+
+    def test_fresh_marker_is_refused_off_a_bootstrap_frame(self) -> None:
+        frame = ab.render_frame(
+            {"turn": "2", "max": "4", "reply_to": "%1", "server": SOCKET,
+             "bridge": "a" * 32, "fresh": "1"}, "body")
+        with self.assertRaisesRegex(ab.BridgeError, "fresh marker"):
+            ab.parse_frame(frame)
 
 
 # --- 3b. what receive rejects -------------------------------------------------

@@ -91,7 +91,7 @@ whole bridge. Every row below runs as `python3 "$SCRIPT" <command>`:
 | Action | Command | When |
 | --- | --- | --- |
 | Identity | `identity` | once per pane, early |
-| Start (A) | `start --target %N --max-turns N --body-file F [--goal-phrase P]` | first outbound frame |
+| Start (A) | `start --target %N --max-turns N --body-file F [--goal-phrase P] [--fresh]` | first outbound frame |
 | Receive | `receive --frame-file F --body-out O` | every inbound frame |
 | Receive (no copy) | `receive --from-pane %N --body-out O` | when your UI mangles the frame it shows you |
 | Reply | `reply --body-file F` | after doing the turn's work |
@@ -178,6 +178,29 @@ payload goes in as one atomic bracketed paste (`load-buffer` + `paste-buffer
 separately as a key and the helper confirms
 the frame actually left the input box, backing off between retries. That whole
 dance is the reason to use the helper instead of hand-rolled `send-keys`.
+
+## Fresh bridge
+
+When the user asks for a "fresh bridge", a "new bridge", or similar, both
+agents drop any bridge they have and continue with the new one. Do not ask
+first, and do not report the old bridge as a problem.
+
+- **Agent A** adds `--fresh` to `start`. The helper ends this pane's existing
+  bridge and clears its own abort sentinel, exactly as `reset` does, then sends
+  a bootstrap frame marked `fresh=1`. Do not run a separate `reset`.
+- **Agent B** does nothing special. When a `fresh=1` frame arrives, `receive`
+  ends B's existing bridge and accepts the new one. `superseded` in the result
+  names the bridge it replaced; mention it once to the user. B's work on the
+  old bridge is over: do not reply to it.
+- **B's own user** saying "fresh bridge" or "new bridge" means `reset` in B's
+  pane, then wait for the new frame, or run `start --fresh` if B's user wants B
+  to open it.
+
+Two limits hold. A `fresh=1` frame replaces a bridge only when it comes from
+the pane that bridge already talks to; from any other pane it is refused with
+`a fresh bridge may only replace a bridge with the same peer pane`. And a
+human's abort sentinel still wins: `--fresh` clears only this pane's own
+sentinel, never the global one or the peer's.
 
 ## Receiving a frame
 
@@ -431,7 +454,7 @@ the user through the harness's question tool, e.g. `AskUserQuestion` in Claude
 Code, and wait. Fall back to a numbered list only where no such tool exists. The
 options are:
 
-1. **Continue.** Run `reset`, then `start` a *new* bridge to the same pane. The
+1. **Continue.** Run `start --fresh` to open a *new* bridge to the same pane. The
    new body must carry the exchange forward: what had been established, what
    question is still open, and one line saying why the last bridge ended. Pass
    the granted turn count as `--max-turns` — the counter starts again at 1, and
@@ -449,11 +472,10 @@ no number at all.
 Never resend the old frame under either choice. Its token died with the old
 bridge and the peer refuses it — that refusal is the design working.
 
-One thing `reset` cannot reach: the peer's pane. If it is still sitting in
-`awaiting_reply`, your fresh bootstrap frame is refused there with `no new frame
-is expected in the current bridge state`, until its own stale timeout expires.
-Tell the user that the peer pane needs its own `reset`; you cannot run it for
-them.
+Always use `--fresh` for *Continue*. A plain `start` after `reset` does not
+reach the peer's pane: if it still holds the old bridge, the frame is refused
+there with `no new frame is expected in the current bridge state`, or
+`bridge token mismatch`.
 
 Asking is not a licence to keep going. Each round is a fresh, explicit decision
 by the human, never a default and never a loop you drive yourself.
