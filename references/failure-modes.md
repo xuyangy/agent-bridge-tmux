@@ -372,6 +372,20 @@ Legitimate triggers: a second bridge started while one was live; a frame replaye
 from scrollback; someone hand-editing a frame. Start a fresh bridge rather than
 relaxing the check.
 
+## "stale or duplicate initial bootstrap frame"
+
+This pane has already started or accepted a bridge with this frame's token. The
+frame is an old start message: usually one copied out of scrollback, or pasted
+a second time. It is refused before anything else happens, so the current
+bridge keeps running and no body is written. Do not route around it. If the
+peer wants a new bridge, it sends a new `start`, which carries a new token.
+
+Each pane keeps every token it has minted or accepted for as long as its state
+file exists, including across `reset` and timeouts. A state file written by a
+helper that predates this history holds only its most recent token. Older
+tokens from before the upgrade are not known, and a replay of one of those is
+not caught.
+
 ## "stale, duplicate, or out-of-order turn"
 
 The turn number did not follow the recorded state. Usually a resend, or a frame

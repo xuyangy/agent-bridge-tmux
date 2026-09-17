@@ -737,9 +737,39 @@ def load_state(identity: dict[str, str]) -> dict[str, Any] | None:
 
 
 def save_state(identity: dict[str, str], value: dict[str, Any]) -> None:
+    """Write this pane's state, carrying its bootstrap history forward.
+
+    `seen` maps every bridge token this pane has minted or accepted to when it
+    was first recorded. validate_inbound refuses a bootstrap frame whose token
+    is in it, so a replayed start message can neither re-deliver an old body
+    nor replace a live bridge. The history lives as long as the state file,
+    with no cap and no expiry: any bound would let an old frame work again.
+
+    The token of the state being overwritten is folded in too, so a file
+    written before `seen` existed keeps its one known token across the first
+    write. Tokens that file had already forgotten cannot be recovered.
+    """
+    try:
+        previous = load_state(identity) or {}
+    except BridgeError:
+        previous = {}
+    seen = dict(previous.get("seen") or {})
+    seen.update(value.get("seen") or {})
+    now = time.time()
+    for token in (previous.get("bridge"), value.get("bridge")):
+        if isinstance(token, str) and token:
+            seen.setdefault(token, now)
     value = dict(value)
-    value["updated_at"] = time.time()
+    value["seen"] = seen
+    value["updated_at"] = now
     atomic_json(Path(identity["state_file"]), value)
+
+
+def bootstrap_seen(state: dict[str, Any] | None, token: str) -> bool:
+    """Whether this pane has already minted or accepted `token` (see save_state)."""
+    if not state:
+        return False
+    return token == state.get("bridge") or token in (state.get("seen") or {})
 
 
 def state_deadline(state: dict[str, Any] | None) -> float | None:
@@ -2060,6 +2090,11 @@ def validate_inbound(args: argparse.Namespace, identity: dict[str, str],
     if (state and state.get("status") == "timed_out"
             and state.get("bridge") == meta["bridge"]):
         raise BridgeError(f"{state.get('reason')}; bridge aborted; do not resend")
+
+    # Before the supersede below and before any body is written: a replayed
+    # start message must leave the current bridge and the disk untouched.
+    if meta.get("bootstrap") is not None and bootstrap_seen(state, meta["bridge"]):
+        raise BridgeError("stale or duplicate initial bootstrap frame")
 
     superseded = None
     if (state and state.get("status") in ("pending", "awaiting_reply")

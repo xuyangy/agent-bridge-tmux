@@ -189,7 +189,7 @@ This is automatic; both sides just need the same version of the script.
 python3 -m unittest discover -s tests
 ```
 
-247 tests, no dependencies, no tmux server needed — they stub the transport and
+254 tests, no dependencies, no tmux server needed — they stub the transport and
 check framing, the integrity checksum, the state machine, turn bounds, timeouts,
 and the submit check. They do not prove delivery; that part is checked against a
 real pane by hand.

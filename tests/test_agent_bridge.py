@@ -552,6 +552,92 @@ class TestFreshBridge(ExchangeCase):
             ab.parse_frame(frame)
 
 
+class TestBootstrapReplay(ExchangeCase):
+    """A start message this pane already minted or accepted is never taken again."""
+
+    def accept_fresh(self, body: str, tag: str) -> str:
+        self.as_agent(self.a)
+        self.start(body, fresh=True)
+        frame = self.wire.last
+        self.as_agent(self.b)
+        self.receive(frame, tag)
+        return frame
+
+    def assert_replay_refused(self, frame: str, tag: str) -> None:
+        self.as_agent(self.b)
+        before = ab.load_state(self.b)
+        with self.assertRaisesRegex(ab.BridgeError, "stale or duplicate initial bootstrap"):
+            self.receive(frame, tag)
+        self.assertFalse((self.root / f"{tag}-body.txt").exists())
+        after = ab.load_state(self.b)
+        self.assertEqual({k: v for k, v in after.items() if k != "seen"},
+                         {k: v for k, v in before.items() if k != "seen"})
+
+    def test_a_replayed_fresh_frame_cannot_replace_the_live_bridge(self) -> None:
+        first = self.accept_fresh("task one", "b1")
+        self.accept_fresh("task two", "b2")
+        current = ab.load_state(self.b)["bridge"]
+        self.assert_replay_refused(first, "b3")
+        self.assertEqual(ab.load_state(self.b)["status"], "awaiting_reply")
+        self.assertEqual(ab.load_state(self.b)["bridge"], current)
+        self.reply("answer to two", "b")
+        self.as_agent(self.a)
+        self.assertEqual(self.receive(self.wire.last, "a")["turn"], 2)
+
+    def test_a_replayed_bootstrap_is_refused_after_the_bridge_ends(self) -> None:
+        self.start("one-way", max_turns=1)
+        first = self.wire.last
+        self.as_agent(self.b)
+        self.receive(first, "b1")
+        self.as_agent(self.a)
+        self.start("another", max_turns=1)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b2")
+        self.assert_replay_refused(first, "b3")
+
+    def test_a_replayed_bootstrap_is_refused_after_reset(self) -> None:
+        first = self.accept_fresh("task one", "b1")
+        ab.command_reset(types.SimpleNamespace(all=False))
+        self.assert_replay_refused(first, "b2")
+
+    def test_a_replayed_bootstrap_is_refused_after_a_timeout(self) -> None:
+        first = self.accept_fresh("task one", "b1")
+        state = ab.load_state(self.b)
+        state["updated_at"] = time.time() - ab.STALE_STATE_TIMEOUT - 1
+        ab.atomic_json(Path(self.b["state_file"]), state)
+        self.accept_fresh("task two", "b2")
+        self.assert_replay_refused(first, "b3")
+
+    def test_a_state_file_without_history_keeps_its_current_token(self) -> None:
+        # A file written before `seen` existed: live bridge T1, no history.
+        first = self.accept_fresh("task one", "b1")
+        state = ab.load_state(self.b)
+        del state["seen"]
+        ab.atomic_json(Path(self.b["state_file"]), state)
+        self.accept_fresh("task two", "b2")
+        self.assert_replay_refused(first, "b3")
+
+    def test_a_refused_frame_does_not_enter_the_history(self) -> None:
+        self.accept_fresh("task one", "b1")
+        stranger = make_identity(self.root, "%9")
+        self.as_agent(stranger)
+        self.start("not your peer", fresh=True)
+        refused = self.wire.last
+        token = ab.parse_frame(refused)[0]["bridge"]
+        self.as_agent(self.b)
+        with self.assertRaisesRegex(ab.BridgeError, "same peer pane"):
+            self.receive(refused, "b2")
+        self.assertNotIn(token, ab.load_state(self.b)["seen"])
+        # Once B is free, the same frame is a valid new bridge.
+        ab.command_reset(types.SimpleNamespace(all=False))
+        self.assertEqual(self.receive(refused, "b3")["action"], "process")
+
+    def test_the_sender_records_the_token_it_minted(self) -> None:
+        self.start("task", max_turns=4)
+        state = ab.load_state(self.a)
+        self.assertIn(state["bridge"], state["seen"])
+
+
 # --- 3b. what receive rejects -------------------------------------------------
 
 
