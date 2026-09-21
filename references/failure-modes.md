@@ -115,6 +115,13 @@ turn; the pane is showing a scrolling log; a modal or pager is open. If the peer
 is genuinely working a long job, re-run the same `send`/`reply` command, or raise
 `AGENT_BRIDGE_READY_TIMEOUT`.
 
+A scroll view covers the input box: tmux copy mode, the Claude Code transcript
+view (ctrl+o), or the codex transcript view. The helper closes it before it
+sends, and says so on stderr. A person reading in it loses their place; they
+can reopen it afterwards. It presses each close key once per send. If the view
+is still open after that, the helper waits for it like a busy pane, and the
+`not ready` line names it. Close it (`q` or ctrl+o) to let the message in.
+
 The wait is interruptible. The budget is one monotonic span that also covers the
 two captures and the 0.6s stability pause per round, so it cannot drift past what
 you asked for, and the abort sentinels are read every 2s *during* the wait — your

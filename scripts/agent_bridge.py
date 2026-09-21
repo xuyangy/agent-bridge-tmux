@@ -1300,6 +1300,87 @@ def looks_ready(capture: str) -> bool:
     return not BUSY_RE.search("\n".join(lines[-TAIL_LINES:]))
 
 
+# A scroll view owned by the agent, recognised by the key-hint footer it draws
+# at the bottom of the screen. While it is open the input box is gone, the
+# screen is still and no busy wording shows, so looks_ready alone calls it idle
+# and the frame is typed into the viewer instead of the prompt. Only the last
+# few lines are searched: a reply that quotes these hints higher up must not
+# be read as an open view.
+CLAUDE_VIEWER = "Claude Code transcript view"
+CODEX_VIEWER = "codex transcript view"
+COPY_MODE = "tmux copy mode"
+CLAUDE_TOGGLE_RE = re.compile(
+    r"Showing detailed transcript\s*·\s*(?P<key>\S+) to toggle", re.IGNORECASE)
+VIEWER_FOOTERS = (
+    (CLAUDE_VIEWER, CLAUDE_TOGGLE_RE),
+    (CODEX_VIEWER,
+     re.compile(r"\bq close\s+esc to edit prev\b"
+                r"|↑/↓ to scroll\s+pgup/pgdn to page\s+home/end to jump")),
+)
+VIEWER_TAIL_LINES = 3
+
+
+def pane_in_copy_mode(target: str) -> bool:
+    """tmux's own scroll view. It is invisible to capture-pane, which reads the
+    pane underneath, and while it is on send-keys reaches tmux, not the agent."""
+    result = run_tmux(["display-message", "-p", "-t", target, "#{pane_in_mode}"],
+                      check=False)
+    return result.returncode == 0 and result.stdout.strip() == "1"
+
+
+def viewer_open(target: str, capture: str) -> str | None:
+    """Name the scroll view covering the target's input box, or None."""
+    if pane_in_copy_mode(target):
+        return COPY_MODE
+    tail = viewer_tail(capture)
+    for name, footer in VIEWER_FOOTERS:
+        if footer.search(tail):
+            return name
+    return None
+
+
+def viewer_tail(capture: str) -> str:
+    clean = ANSI_RE.sub("", capture)
+    lines = [line.rstrip() for line in clean.splitlines() if line.strip()]
+    return "\n".join(lines[-VIEWER_TAIL_LINES:])
+
+
+def toggle_key(label: str) -> str | None:
+    """Turn a footer key label such as "ctrl+o" into tmux key syntax ("C-o").
+    None for a label this cannot map, so no guessed key is pressed."""
+    match = re.fullmatch(r"(?:ctrl|control)\+(\w)", label, re.IGNORECASE)
+    return f"C-{match.group(1).lower()}" if match else None
+
+
+def close_viewer(target: str, viewer: str, capture: str) -> bool:
+    """Close the scroll view so the frame reaches the input box.
+
+    A person may be reading in it. While a bridge is live, the message wins:
+    they can reopen the view afterwards. Returns False when no close key is
+    known, and the view is then waited out instead.
+
+    Copy mode is tmux's, so it is cancelled in tmux. The two transcript views
+    belong to the agent, so their key goes to the app, behind the same focus
+    nudge delivery uses: an app that holds keys while unfocused would hold
+    this one too. Claude Code's key is read from its own footer, which shows
+    the key as bound, not the default.
+    """
+    if viewer == COPY_MODE:
+        return run_tmux(["send-keys", "-t", target, "-X", "cancel"],
+                        check=False).returncode == 0
+    if viewer == CLAUDE_VIEWER:
+        match = CLAUDE_TOGGLE_RE.search(viewer_tail(capture))
+        key = toggle_key(match.group("key")) if match else None
+    elif viewer == CODEX_VIEWER:
+        key = "q"
+    else:
+        key = None
+    if key is None:
+        return False
+    with Focus(target):
+        return run_tmux(["send-keys", "-t", target, key], check=False).returncode == 0
+
+
 class PeerNotReady(BridgeError):
     """The peer pane never went idle, so NOTHING was delivered.
 
@@ -1354,6 +1435,11 @@ def wait_ready(target: str, timeout: float = READY_TIMEOUT,
         raise BridgeError(f"target pane {target} does not exist on this tmux server")
     deadline = time.monotonic() + max(0.0, timeout)
     attempt = 0
+    viewer: str | None = None
+    # Each kind of view is closed once per wait. If it is still there after
+    # that, the key did not work, and pressing it again could reopen what it
+    # just closed; the view is then waited out like a busy pane.
+    closed: set[str] = set()
     while True:
         attempt += 1
         if identity is not None:
@@ -1370,7 +1456,14 @@ def wait_ready(target: str, timeout: float = READY_TIMEOUT,
         second = capture_target(target)
         if deadline - time.monotonic() <= 0:
             break
-        if first == second and looks_ready(second):
+        viewer = viewer_open(target, second)
+        if viewer is not None and viewer not in closed:
+            closed.add(viewer)
+            if close_viewer(target, viewer, second):
+                print(f"agent-bridge: closed the {viewer} on {target} to deliver",
+                      file=sys.stderr)
+                continue
+        if viewer is None and first == second and looks_ready(second):
             return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1378,12 +1471,16 @@ def wait_ready(target: str, timeout: float = READY_TIMEOUT,
         if not pane_exists(target):
             raise BridgeError(f"target pane {target} disappeared while waiting for it to go idle")
         delay = min(ready_step(attempt), remaining)
-        print(f"agent-bridge: {target} not ready (check {attempt}); "
+        why = f", {viewer} is open" if viewer else ""
+        print(f"agent-bridge: {target} not ready (check {attempt}{why}); "
               f"waiting {delay:g}s, then re-checking", file=sys.stderr)
         sleep_watching_abort(delay, identity)
     raise PeerNotReady(
         f"target {target} did not reach a confirmed idle prompt within "
-        f"{timeout:g}s of waiting. Nothing was sent and no turn was used: the "
+        f"{timeout:g}s of waiting"
+        + (f" ({viewer} was still open and did not close; close it to let the message in)"
+           if viewer else "")
+        + f". Nothing was sent and no turn was used: the "
         f"bridge is intact, so wait and run the same command again rather than "
         f"resetting it"
     )

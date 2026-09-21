@@ -1911,6 +1911,11 @@ class TestWaitReadyKeepsRechecking(unittest.TestCase):
     budget — one monotonic span covering captures and pauses, not only sleeps —
     and a human's abort must be able to cut that wait short."""
 
+    def setUp(self) -> None:
+        patcher = mock.patch.object(ab, "pane_in_copy_mode", lambda t: False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_the_step_grows_then_holds_at_the_ceiling(self) -> None:
         steps = [ab.ready_step(n) for n in range(1, 12)]
         self.assertEqual(steps[:len(ab.READY_BACKOFF)], list(ab.READY_BACKOFF))
@@ -1997,6 +2002,101 @@ class TestWaitReadyKeepsRechecking(unittest.TestCase):
             with self.assertRaises(ab.BridgeError):
                 ab.wait_ready("%9", timeout=900, identity=identity)
         self.assertLess(clock(), 60, "the sleep must be sliced, not taken whole")
+
+
+class TestAScrollViewIsNotAPrompt(unittest.TestCase):
+    """A scroll view is still and says nothing busy, so without its own check
+    the frame is typed into the viewer instead of the input box."""
+
+    CLAUDE = ("old reply\n\n"
+              "Showing detailed transcript \u00b7 ctrl+o to toggle\n")
+    CODEX = ("/ T R A N S C R I P T / / / /\nold reply\n"
+             "\u2191/\u2193 to scroll   pgup/pgdn to page   home/end to jump\n"
+             "q close   esc to edit prev\n")
+
+    def viewer(self, screen: str, copy_mode: bool = False) -> str | None:
+        with mock.patch.object(ab, "pane_in_copy_mode", lambda t: copy_mode):
+            return ab.viewer_open("%9", screen)
+
+    def test_each_view_is_named(self) -> None:
+        self.assertEqual(self.viewer(self.CLAUDE), "Claude Code transcript view")
+        self.assertEqual(self.viewer(self.CODEX), "codex transcript view")
+        self.assertEqual(self.viewer("\u276f \n", copy_mode=True), "tmux copy mode")
+
+    def test_an_idle_prompt_is_not_a_view(self) -> None:
+        self.assertIsNone(self.viewer("assistant output\n\u276f \n"))
+
+    def test_hints_quoted_higher_up_do_not_count(self) -> None:
+        screen = self.CLAUDE + "".join(f"reply line {n}\n" for n in range(5)) + "\u276f \n"
+        self.assertIsNone(self.viewer(screen))
+
+    def test_wait_ready_closes_an_open_view_then_delivers(self) -> None:
+        state = {"open": True}
+        pressed: list[str] = []
+
+        def close(target: str, viewer: str, capture: str) -> bool:
+            pressed.append(viewer)
+            state["open"] = False
+            return True
+
+        with fake_clock(), \
+                mock.patch.object(ab, "pane_exists", lambda t: True), \
+                mock.patch.object(ab, "pane_in_copy_mode", lambda t: False), \
+                mock.patch.object(ab, "close_viewer", close), \
+                mock.patch.object(ab, "capture_target",
+                                  lambda t: self.CLAUDE if state["open"] else "\u276f \n"):
+            ab.wait_ready("%9", timeout=300)
+        self.assertEqual(pressed, ["Claude Code transcript view"])
+
+    def test_a_view_that_will_not_close_is_pressed_once_then_waited_out(self) -> None:
+        pressed: list[str] = []
+
+        def close(target: str, viewer: str, capture: str) -> bool:
+            pressed.append(viewer)
+            return True
+
+        with fake_clock(), \
+                mock.patch.object(ab, "pane_exists", lambda t: True), \
+                mock.patch.object(ab, "pane_in_copy_mode", lambda t: True), \
+                mock.patch.object(ab, "close_viewer", close), \
+                mock.patch.object(ab, "capture_target", lambda t: "\u276f \n"):
+            with self.assertRaises(ab.PeerNotReady) as caught:
+                ab.wait_ready("%9", timeout=60)
+        self.assertEqual(pressed, ["tmux copy mode"])
+        self.assertIn("tmux copy mode was still open", str(caught.exception))
+
+
+class TestClosingAScrollView(unittest.TestCase):
+    """Each view is closed with its own key, sent the way that view reads it."""
+
+    def keys_sent(self, viewer: str, capture: str = "") -> list[list[str]]:
+        sent: list[list[str]] = []
+
+        def run(args: list[str], **kw: Any) -> Any:
+            sent.append(args)
+            return ab.subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(ab, "run_tmux", run):
+            ab.close_viewer("%9", viewer, capture)
+        return [args for args in sent if "-H" not in args and "display-message" not in args]
+
+    def test_copy_mode_is_cancelled_in_tmux(self) -> None:
+        self.assertEqual(self.keys_sent(ab.COPY_MODE),
+                         [["send-keys", "-t", "%9", "-X", "cancel"]])
+
+    def test_claude_gets_the_key_its_footer_names(self) -> None:
+        footer = "Showing detailed transcript \u00b7 ctrl+t to toggle\n"
+        self.assertEqual(self.keys_sent(ab.CLAUDE_VIEWER, footer),
+                         [["send-keys", "-t", "%9", "C-t"]])
+
+    def test_codex_gets_q(self) -> None:
+        self.assertEqual(self.keys_sent(ab.CODEX_VIEWER),
+                         [["send-keys", "-t", "%9", "q"]])
+
+    def test_an_unmappable_key_label_presses_nothing(self) -> None:
+        self.assertIsNone(ab.toggle_key("F12"))
+        footer = "Showing detailed transcript \u00b7 F12 to toggle\n"
+        self.assertEqual(self.keys_sent(ab.CLAUDE_VIEWER, footer), [])
 
 
 # --- 14. verifying a guessed pane against process ancestry --------------------
