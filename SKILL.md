@@ -393,7 +393,7 @@ call* below before you decide anything.
 
 If a bridge died mid-exchange — aborted, interrupted, or the agent crashed — the
 pane still holds `pending` or `awaiting_reply` state and refuses a new `start`.
-Both expire on their own after 1 hour; `reset` releases the pane now. It ends
+Both expire on their own after 3 hours; `reset` releases the pane now. It ends
 the old exchange and clears the abort sentinels in one step, but does not resume
 anything and does not tell the peer. `clear-abort` removes sentinels only and
 deliberately leaves bridge state alone.

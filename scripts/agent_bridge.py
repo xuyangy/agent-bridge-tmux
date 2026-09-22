@@ -134,7 +134,7 @@ CHUNK_SIZE = int(os.environ.get("AGENT_BRIDGE_CHUNK", "8"))
 # characters from the middle of a frame (caught by the sum= checksum, observed
 # in the field at 0.04s); the pause exists to let its input loop drain.
 CHUNK_PAUSE = float(os.environ.get("AGENT_BRIDGE_CHUNK_PAUSE", "0.08"))
-DEFAULT_ACK_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_ACK_TIMEOUT", "3600"))
+DEFAULT_ACK_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_ACK_TIMEOUT", "10800"))
 # How long an "awaiting_reply" state stays believable. Measured from the last
 # state write, so an agent that is genuinely working keeps its turn — the clock
 # only runs out on a pane whose agent stopped existing.

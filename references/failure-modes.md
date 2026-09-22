@@ -401,7 +401,7 @@ precisely because counting turns by hand is the thing models get wrong.
 
 ## "ack timeout exceeded; bridge aborted; do not resend"
 
-The peer's reply arrived after the deadline (default 3600s, override with
+The peer's reply arrived after the deadline (default 10800s, override with
 `AGENT_BRIDGE_ACK_TIMEOUT`). The bridge is over; do not restart it by resending.
 
 This bridge is over, but the conversation need not be. Report the timeout and ask
@@ -452,7 +452,7 @@ state stands, and `clear-abort` does not touch it. Before this was fixed,
 delete a state file under a temp directory by hand.
 
 Now both statuses expire. `pending` uses its `ack_deadline`; `awaiting_reply`
-expires `AGENT_BRIDGE_STALE_TIMEOUT` seconds (default 3600, same as the ack
+expires `AGENT_BRIDGE_STALE_TIMEOUT` seconds (default 10800, same as the ack
 timeout) after its last state write, so an agent that is genuinely still working
 keeps its turn and only a dead pane loses it. `start`, `receive`, and `status`
 each apply the expiry, so whichever one runs first unsticks the pane.

@@ -82,7 +82,7 @@ The last bridge in that pane did not finish. It was aborted, you interrupted it,
 or the agent crashed while it still owed a reply. The pane remembers that and
 will not start a new one.
 
-It clears itself after 1 hour (`AGENT_BRIDGE_STALE_TIMEOUT`). To clear it
+It clears itself after 3 hours (`AGENT_BRIDGE_STALE_TIMEOUT`). To clear it
 now, in that pane:
 
 ```bash
@@ -120,8 +120,8 @@ the updated skill to use these launch settings.
 - the target pane never goes idle
 - the frame could not be submitted into the peer's input box
 - a frame arrives corrupted (its integrity checksum does not match)
-- no reply within the ack timeout (default 3600s, set `AGENT_BRIDGE_ACK_TIMEOUT`)
-- an unfinished bridge goes stale (default 3600s, set `AGENT_BRIDGE_STALE_TIMEOUT`)
+- no reply within the ack timeout (default 10800s, set `AGENT_BRIDGE_ACK_TIMEOUT`)
+- an unfinished bridge goes stale (default 10800s, set `AGENT_BRIDGE_STALE_TIMEOUT`)
 - the peer is on another tmux server
 - you create the abort file
 
