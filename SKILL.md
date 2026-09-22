@@ -371,9 +371,41 @@ forward, increments the turn, and refuses to exceed `max`.
 Report the `OUTBOUND` line and the ack deadline, then end your turn so the peer
 can answer. Do not repeat the abort command here unless something went wrong.
 
+## Closing the bridge
+
+**Both agents keep sending until both have acknowledged, on the wire, that the
+bridge is closed.** Neither agent closes it alone. Every frame that arrives with
+`action: process` gets a reply, including when you think the work is finished.
+Going quiet is not closing: to the peer, silence looks exactly like a crash, and
+it waits out an acknowledgement deadline of up to 3 hours before it knows.
+
+A close takes two frames:
+
+1. **Request.** The agent that thinks the exchange is done sends an ordinary
+   reply whose body starts, after the `NOTICE` line, with `BRIDGE CLOSE:
+   requested`, then says what the exchange reached and why nothing is left open.
+2. **Confirm.** The peer checks that claim like any other. If it agrees, it
+   replies with a body that starts with `BRIDGE CLOSE: confirmed`. If it does
+   not, it says what is still open, and the exchange goes on.
+
+A request is not a close. Until the confirmation arrives, the requester still
+answers every frame. The confirmation is the last frame: the agent that sent it
+sends nothing more, and the agent that receives it replies to it with nothing.
+
+The helper does not see the handshake, so after it both panes still hold
+`pending` or `awaiting_reply` state. Each agent runs `reset` once the close is
+confirmed — the confirmer after its `reply`, the requester after its `receive` —
+then reports the close to its user.
+
+A close needs two turns, so send the request no later than turn `max - 1`. A
+confirmation sent as turn `max` arrives with `action: stop`; it still completes
+the close. A request sent as turn `max` cannot be confirmed, so that exchange
+ends on the turn limit instead.
+
 ## Stopping
 
-Stop issuing sends when any of these fires — the helper enforces each one, so a
+Stop issuing sends when a close is confirmed — see *Closing the bridge*. Until
+then, stop only when one of these fires. The helper enforces each one, so a
 refusal is the system working, not an obstacle to route around:
 
 - the final allowed frame is sent or received (`turn` reaches `max`)
@@ -384,7 +416,7 @@ refusal is the system working, not an obstacle to route around:
 - a human creates an abort sentinel
 
 Stopping sends is not the same as closing the exchange for good. Unless the
-reason was `GOAL_PHRASE` or a human's abort sentinel, see *Ending is the user's
+reason was a confirmed close, `GOAL_PHRASE`, or a human's abort sentinel, see *Ending is the user's
 call* below before you decide anything.
 
 `status` reports the state and expires it if its deadline has passed.
@@ -436,14 +468,18 @@ during the wait, so it stops a long wait immediately.
 
 ## Ending is the user's call, not yours
 
-Only two endings are final on their own: a body carrying `GOAL_PHRASE` — the
-answer arrived — and a human's own abort sentinel. Report those and stop, asking
-nothing.
+Only three endings are final on their own:
+
+- a close both agents acknowledged (see *Closing the bridge*)
+- a body carrying `GOAL_PHRASE`, because the answer arrived
+- a human's own abort sentinel
+
+Report those and stop, asking nothing.
 
 For every other ending, stop sending and ask. Two kinds reach here:
 
-- **The turn limit.** `turn` reached `max`. Nothing is wrong; the budget simply
-  ran out, possibly mid-thought.
+- **The turn limit.** `turn` reached `max` before a close was confirmed. Nothing
+  is wrong; the budget simply ran out, possibly mid-thought.
 - **A break.** A missed acknowledgement deadline, `status` reporting a timeout,
   a peer that crashed, or a pane still holding `pending` or `awaiting_reply`
   state. Readiness is *not* on this list — see below.

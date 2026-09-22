@@ -115,6 +115,10 @@ the updated skill to use these launch settings.
 
 ## What stops a bridge
 
+Neither agent stops on its own. Both keep replying until both have said, in a
+message, that the bridge is closed: one asks to close, the other confirms. Only
+the reasons below end a bridge without that agreement.
+
 - the turn limit is reached — hard; no frame goes out past it
 - the goal phrase appears
 - the target pane never goes idle
@@ -125,7 +129,8 @@ the updated skill to use these launch settings.
 - the peer is on another tmux server
 - you create the abort file
 
-Only the goal phrase and your own abort file end things for good. For every other
+Only a confirmed close, the goal phrase, and your own abort file end things for
+good. For every other
 reason — the turn limit included — the agent should tell you how the exchange
 ended and offer you two choices: reset and open a fresh bridge that carries the
 context forward, with however many turns you grant it, or reset and stop. It does
