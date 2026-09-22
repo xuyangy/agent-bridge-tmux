@@ -96,6 +96,22 @@ unstick this.
 `status` tells you which case you are in: `start_blocked` and
 `expires_in_seconds`.
 
+## What a successful send means
+
+`OUTBOUND ... delivery=delivered acceptance=unknown` reports transport delivery
+to the pane. It does not prove the receiver accepted the frame or processed the
+body. A validated reply is the acknowledgement.
+
+Before replying, the helper checks local expiry and the peer's stored bridge
+state, including after waiting for a busy pane. A known expired or ended peer
+bridge is refused before delivery without using a turn, and the local record
+is terminated with the peer reason. Within 300s of the peer's deadline, the
+helper warns that validation may happen too late; configure this threshold with
+`AGENT_BRIDGE_ACK_WARN_SECONDS` (0 disables advance warnings). `status` also exposes
+the peer's state and ack deadline. Missing peer state leaves acceptance unknown,
+and the peer can still expire or reset after a check. These checks run on helper
+invocation; there is no background expiry notifier.
+
 ## Starting over with a fresh bridge
 
 Tell either agent you want a "fresh bridge" or a "new bridge". The agent that
@@ -194,7 +210,7 @@ This is automatic; both sides just need the same version of the script.
 python3 -m unittest discover -s tests
 ```
 
-254 tests, no dependencies, no tmux server needed — they stub the transport and
+273 tests, no dependencies, no tmux server needed — they stub the transport and
 check framing, the integrity checksum, the state machine, turn bounds, timeouts,
 and the submit check. They do not prove delivery; that part is checked against a
 real pane by hand.

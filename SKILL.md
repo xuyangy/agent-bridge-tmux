@@ -20,6 +20,19 @@ readiness, transport, and logging. Use it. Do not reconstruct any of that with
 ad-hoc `tmux send-keys` and shell quoting; the mistakes there are silent ones.
 When something behaves oddly, read `references/failure-modes.md` before guessing.
 
+## Complete the send before ending your turn
+
+When a bridge reply is due, finishing the work and writing its body file do not
+finish the turn. Run `start` or `reply`, wait for the helper to finish, and inspect
+its result before giving your final response. A sentence such as "Sending the
+final evidence to window 2" is not a send. Report the completed call in past
+tense, with its actual `OUTBOUND` line, or report the concrete failure.
+
+`OUTBOUND ... delivery=delivered acceptance=unknown` means the transport delivered
+the frame to the pane; it does **not** establish that the receiving helper
+accepted it or that the agent processed the body. The peer's validated reply
+acknowledges it. If acceptance is unclear, run `status`; do not send a duplicate.
+
 ## Precondition: one tmux server
 
 Pane ids like `%17` are unique only within a tmux server, and `send-keys` targets
@@ -95,7 +108,7 @@ whole bridge. Every row below runs as `python3 "$SCRIPT" <command>`:
 | Receive | `receive --frame-file F --body-out O` | every inbound frame |
 | Receive (no copy) | `receive --from-pane %N --body-out O` | when your UI mangles the frame it shows you |
 | Reply | `reply --body-file F` | after doing the turn's work |
-| Status | `status` | check turn, ack deadline, `start_blocked` |
+| Status | `status` | check local state, peer state/deadline, `start_blocked` |
 | Reset | `reset` | pane says "already has an active bridge" |
 | Clear abort | `clear-abort` | remove this pane's abort sentinel — does not release state |
 
@@ -161,7 +174,8 @@ mentioned.
 
 3. Run `start` with that body file and `TARGET_PANE`, plus `MAX_TURNS` and
    `GOAL_PHRASE` if the user gave them.
-4. Report the `OUTBOUND` log line, the abort command, and the ack deadline. Do
+4. [Complete the send](#complete-the-send-before-ending-your-turn), then report
+   the `OUTBOUND` log line, the abort command, and the ack deadline. Do
    not ask the human to paste the reply; it arrives in this pane automatically.
    Then end your turn, so your pane goes idle and B's reply can land.
 
@@ -357,6 +371,12 @@ is about; `sender_cwd` is context for when it is missing or unclear.
 
 ## Replying
 
+After a long-running task, idle gap, or resumed agent session, run `status`
+before replying. Check both local state and `peer`: a live local bridge does
+not imply the peer's ack deadline is still open. An expired or ended peer
+bridge is a break; follow *Ending is the user's call*. An unavailable peer
+snapshot means its state is unknown, not healthy.
+
 Do the work, write only your response to a fresh scratch file, then run `reply`
 on it. Open every reply body with the same `NOTICE` line the start template
 carries — see *Shared goal, independent judgment*. If the peer's body contains
@@ -368,8 +388,20 @@ argument exists. The helper replies to the validated `reply_to`, stamps
 your own cached pane and socket, carries the bridge token and goal phrase
 forward, increments the turn, and refuses to exceed `max`.
 
-Report the `OUTBOUND` line and the ack deadline, then end your turn so the peer
+[Complete the send](#complete-the-send-before-ending-your-turn), then report
+the `OUTBOUND` line and the ack deadline and end your turn so the peer
 can answer. Do not repeat the abort command here unless something went wrong.
+
+The helper checks local expiry and reads the peer's stored state before sending
+a reply, including after waiting for the pane to become ready. A known expired,
+ended, or incompatible peer bridge is refused before delivery without using a
+turn, and this pane's record is marked terminated with the peer reason. Do not
+retry that refusal as a readiness failure. Missing or unreadable
+peer state produces a warning and leaves acceptance unknown. These checks are
+snapshots, not acceptance receipts; the peer may expire or reset afterwards.
+Within `AGENT_BRIDGE_ACK_WARN_SECONDS` of the peer's deadline (default 300s), the
+helper warns that validation may happen too late. Pass that warning on. It
+neither shortens nor extends the peer's timeout.
 
 ## Closing the bridge
 
@@ -422,6 +454,10 @@ call* below before you decide anything.
 `status` reports the state and expires it if its deadline has passed.
 `start_blocked` tells you whether this pane can open a new bridge, and
 `expires_in_seconds` says how long until it can.
+The `peer` snapshot reports the peer's stored state and whether its ack deadline
+has passed, without modifying that pane. There is no background notifier: these
+checks run when the helper is invoked, so neither a silent agent nor an idle
+bridge produces an automatic notification.
 
 If a bridge died mid-exchange — aborted, interrupted, or the agent crashed — the
 pane still holds `pending` or `awaiting_reply` state and refuses a new `start`.

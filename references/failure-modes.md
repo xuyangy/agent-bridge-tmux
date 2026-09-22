@@ -3,6 +3,43 @@
 Read this when the bridge behaves oddly. The symptoms look alike from the inside;
 the causes do not. Each entry names the symptom first.
 
+## The agent says "sending" but nothing was sent
+
+A saved body file is preparation. Only a completed `start` or `reply` call can
+produce an `OUTBOUND` line. If the agent ends its turn after announcing a send,
+the helper never ran. Finish the call before reporting delivery, or report the
+actual refusal. Check `status` before resuming after an idle gap.
+
+## OUTBOUND was printed, but the peer rejected the frame
+
+`delivery=delivered acceptance=unknown` separates transport delivery from receiver
+validation. A frame can leave the peer's input box and still be refused by
+`receive`, including because the peer's ack deadline passed. The default ack
+timeout is three hours; a configured timeout can be shorter.
+
+`reply` checks its own expiry on invocation and the peer's stored state both
+before and after waiting for readiness. `peer ack timeout exceeded`, an ended
+peer bridge, or incompatible peer state means nothing was sent and no turn was
+used. The local record becomes terminated, retaining the last actual turn and
+the peer failure reason. This is a bridge break, not a busy pane: follow the continuation procedure
+in [the skill](../SKILL.md#ending-is-the-users-call-not-yours), rather than
+retrying the same command.
+
+`status` includes a read-only `peer` snapshot. Missing or unreadable state (for
+example, separate `TMPDIR` settings or a peer using a legacy state root) means
+unknown; it is not proof the bridge is live. Peer snapshots use the current
+per-user state root and canonical socket path; they do not search legacy paths.
+The peer's stored pending ack deadline is used, regardless of the
+sender's timeout configuration. A snapshot cannot prevent expiry or reset
+between that check and `receive`. Use the peer's inbound log to diagnose a
+later refusal; a validated reply is the acknowledgement. No background process
+pushes expiry notifications while the agents are idle.
+
+Within `AGENT_BRIDGE_ACK_WARN_SECONDS` of that deadline (default 300s, set to 0
+to disable advance warnings), the helper warns but still allows a valid send.
+This does not extend the deadline or reserve time for `receive`. A fixed early
+cutoff would shorten the configured timeout, including on short-timeout bridges.
+
 ## Bash warning: setlocale on macOS
 
 `bash: warning: setlocale: LC_ALL: cannot change locale (C.UTF-8)` means a
@@ -505,7 +542,7 @@ like any of them, so the shape is safe to grep for.
 ```
 ...+0200 identity pane=%9 basis=focus-guess detail="TMUX_PANE was unset and ..."
 ...+0200 inbound turn=1/4 peer=%0 bridge=58c58965 outcome=accepted detail="action=process"
-...+0200 target=%0 turn=2/4 first_line="AGENT_B: done."
+...+0200 target=%0 turn=2/4 delivery=delivered acceptance=unknown first_line="AGENT_B: done."
 ...+0200 inbound outcome=refused detail="frame failed its integrity check: these bytes are not…"
 ...+0200 inbound outcome=dropped detail="human abort signal detected: /var/…/1b08f6-9.abort"
 ```
@@ -578,6 +615,8 @@ The question this file exists to answer is the one nothing else could: **a bridg
 went quiet — did the frame arrive and get rejected, or never arrive?** Look for
 an `inbound` line at the expected turn. One with `outcome=refused` says it
 arrived and why it was thrown out. One with `outcome=dropped` says someone had
-already stopped this bridge. No `inbound` line at all means nothing ever reached
-this side, so the problem is upstream — check the sender's log for a matching
-`target=` line, and if that is missing too, it was never sent.
+already stopped this bridge. No `inbound` line means no receive outcome was
+recorded: the frame may not have arrived, the agent may not have called
+`receive`, or logging may have failed. Check the sender's matching `target=`
+line and the tool results to distinguish those cases. A saved body file alone
+does not establish that a send was attempted.

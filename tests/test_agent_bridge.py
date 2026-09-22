@@ -1110,6 +1110,146 @@ class TestTurnBounds(ExchangeCase):
             ab.parse_frame(ab.render_frame(meta, "body"))
 
 
+class TestPeerReplyWindow(ExchangeCase):
+    """Exercise deadline checks through the commands, stubbing only tmux I/O."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        digest = ab.hashlib.sha256(SOCKET.encode()).hexdigest()[:16]
+        for identity in (self.a, self.b):
+            identity["state_file"] = str(
+                self.root / f"{digest}-{identity['self_pane'][1:]}.state.json")
+        ab.send_message = self.original_send
+        self.enterContext(mock.patch.object(ab, "state_root", return_value=self.root))
+        self.ready = self.enterContext(mock.patch.object(ab, "wait_ready"))
+        self.delivery = self.enterContext(mock.patch.object(
+            ab, "deliver", side_effect=lambda target, frame: self.wire.frames.append(frame)))
+        self.enterContext(mock.patch.object(ab, "tmux_value", return_value="1"))
+        self.output = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.noise = self.enterContext(contextlib.redirect_stderr(io.StringIO()))
+        self.start("review", max_turns=4)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        self.delivery.reset_mock()
+        self.ready.reset_mock()
+
+    def expire_peer(self, *args, **kwargs) -> None:
+        state = ab.load_state(self.a)
+        state["ack_deadline"] = time.time() - 1
+        ab.atomic_json(Path(self.a["state_file"]), state)
+
+    def test_expired_peer_refuses_without_transport_or_consuming_a_turn(self) -> None:
+        self.expire_peer()
+        peer_before = Path(self.a["state_file"]).read_bytes()
+        local_before = ab.load_state(self.b)
+        with self.assertRaisesRegex(ab.PeerBridgeUnavailable, "peer ack timeout exceeded"):
+            self.reply("final evidence", "b")
+        self.delivery.assert_not_called()
+        self.ready.assert_not_called()
+        local_after = ab.load_state(self.b)
+        self.assertEqual(local_after["turn"], local_before["turn"])
+        self.assertEqual(local_after["bridge"], local_before["bridge"])
+        self.assertEqual(local_after["status"], "terminated")
+        self.assertIn("peer ack timeout exceeded", local_after["reason"])
+        self.assertFalse(ab.command_status(None)["start_blocked"])
+        self.assertEqual(Path(self.a["state_file"]).read_bytes(), peer_before)
+
+    def test_peer_expiring_during_readiness_wait_is_also_refused(self) -> None:
+        self.ready.side_effect = self.expire_peer
+        before = ab.load_state(self.b)
+        with self.assertRaisesRegex(ab.PeerBridgeUnavailable, "peer ack timeout exceeded"):
+            self.reply("final evidence", "b")
+        self.ready.assert_called_once()
+        self.delivery.assert_not_called()
+        self.assertEqual(ab.load_state(self.b)["turn"], before["turn"])
+        self.assertEqual(ab.load_state(self.b)["status"], "terminated")
+
+    def test_local_stale_reply_is_refused_before_sending(self) -> None:
+        state = ab.load_state(self.b)
+        state["updated_at"] = time.time() - 86400
+        ab.atomic_json(Path(self.b["state_file"]), state)
+        with self.assertRaisesRegex(ab.BridgeError, "owed a reply but went stale"):
+            self.reply("too late", "b")
+        self.delivery.assert_not_called()
+        self.assertEqual(ab.load_state(self.b)["status"], "timed_out")
+
+    def test_reset_expired_replaced_or_wrong_turn_peer_is_refused(self) -> None:
+        original = ab.load_state(self.a)
+        local = ab.load_state(self.b)
+        for changes in ({"status": "terminated"}, {"status": "timed_out"},
+                        {"bridge": "f" * 32}, {"turn": 3},
+                        {"status": "awaiting_reply"}, {"target": "%9"}):
+            with self.subTest(changes=changes):
+                ab.atomic_json(Path(self.b["state_file"]), local)
+                ab.atomic_json(Path(self.a["state_file"]), {**original, **changes})
+                with self.assertRaises(ab.PeerBridgeUnavailable):
+                    self.reply("evidence", "b")
+                self.delivery.assert_not_called()
+                self.assertEqual(ab.load_state(self.b)["turn"], 1)
+                self.assertEqual(ab.load_state(self.b)["status"], "terminated")
+
+    def test_near_deadline_warns_but_preserves_the_peers_valid_reply_window(self) -> None:
+        with mock.patch.object(ab.time, "time", return_value=1000), \
+                mock.patch.object(ab, "ACK_WARN_SECONDS", 300):
+            peer = ab.load_state(self.a)
+            peer["ack_deadline"] = 1030
+            ab.atomic_json(Path(self.a["state_file"]), peer)
+            result = self.reply("ready evidence", "b")
+            self.assertEqual(result["delivery"], "delivered")
+            self.assertIn("only 30.0s left", self.noise.getvalue())
+            self.assertEqual(ab.load_state(self.a)["ack_deadline"], 1030)
+            self.as_agent(self.a)
+            self.assertEqual(self.receive(self.wire.last, "a")["action"], "process")
+
+    def test_near_deadline_warning_is_configurable(self) -> None:
+        with mock.patch.object(ab.time, "time", return_value=1000), \
+                mock.patch.object(ab, "ACK_WARN_SECONDS", 0):
+            peer = ab.load_state(self.a)
+            peer["ack_deadline"] = 1030
+            ab.atomic_json(Path(self.a["state_file"]), peer)
+            self.reply("ready evidence", "b")
+            self.assertNotIn("left before its ack deadline", self.noise.getvalue())
+
+    def test_missing_or_invalid_peer_state_warns_without_claiming_acceptance(self) -> None:
+        for contents in (None, "not json", '{"status":"pending"}'):
+            with self.subTest(contents=contents):
+                local = ab.load_state(self.b)
+                peer_path = Path(self.a["state_file"])
+                if contents is None:
+                    peer_path.unlink(missing_ok=True)
+                else:
+                    peer_path.write_text(contents)
+                result = self.reply("evidence", "b")
+                self.assertEqual(result["delivery"], "delivered")
+                self.assertEqual(result["acceptance"], "unknown")
+                self.assertIn("peer deadline could not be checked", self.noise.getvalue())
+                ab.atomic_json(Path(self.b["state_file"]), local)
+
+    def test_live_peer_receives_reply_and_delivery_reports_unknown_acceptance(self) -> None:
+        result = self.reply("evidence", "b")
+        self.delivery.assert_called_once()
+        self.assertEqual(result["acceptance"], "unknown")
+        self.assertIn("delivery=delivered acceptance=unknown", self.output.getvalue())
+        self.as_agent(self.a)
+        self.assertEqual(self.receive(self.wire.last, "a")["action"], "process")
+
+    def test_status_exposes_expired_peer_without_mutating_either_deadline(self) -> None:
+        self.expire_peer()
+        before = [Path(i["state_file"]).read_bytes() for i in (self.a, self.b)]
+        result = ab.command_status(None)
+        self.assertTrue(result["peer"]["ack_expired"])
+        self.assertTrue(result["peer"]["same_bridge"])
+        self.assertEqual(result["state"]["status"], "awaiting_reply")
+        self.assertEqual([Path(i["state_file"]).read_bytes() for i in (self.a, self.b)], before)
+
+    def test_fresh_bootstrap_can_replace_an_expired_exchange(self) -> None:
+        self.expire_peer()
+        result = self.start("carry context forward", fresh=True, target="%1")
+        self.assertEqual(result["delivery"], "delivered")
+        self.as_agent(self.a)
+        self.assertEqual(self.receive(self.wire.last, "a")["action"], "process")
+
+
 class TestTimeouts(TempRoot):
     def setUp(self) -> None:
         super().setUp()

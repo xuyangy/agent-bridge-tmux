@@ -135,6 +135,8 @@ CHUNK_SIZE = int(os.environ.get("AGENT_BRIDGE_CHUNK", "8"))
 # in the field at 0.04s); the pause exists to let its input loop drain.
 CHUNK_PAUSE = float(os.environ.get("AGENT_BRIDGE_CHUNK_PAUSE", "0.08"))
 DEFAULT_ACK_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_ACK_TIMEOUT", "10800"))
+# Warn about receive latency without shortening the peer's valid reply window.
+ACK_WARN_SECONDS = max(0, float(os.environ.get("AGENT_BRIDGE_ACK_WARN_SECONDS", "300")))
 # How long an "awaiting_reply" state stays believable. Measured from the last
 # state write, so an agent that is genuinely working keeps its turn — the clock
 # only runs out on a pane whose agent stopped existing.
@@ -166,6 +168,10 @@ class BridgeError(RuntimeError):
     def __init__(self, *args: object, log_detail: str | None = None) -> None:
         super().__init__(*args)
         self.log_detail = log_detail
+
+
+class PeerBridgeUnavailable(BridgeError):
+    """Peer state rules out this reply before any transport was attempted."""
 
 
 # --- tmux plumbing ------------------------------------------------------------
@@ -299,6 +305,12 @@ def canonical_socket(socket: str) -> str:
         return socket
 
 
+def pane_file_prefix(socket: str, pane: str, *, root: Path | None = None) -> Path:
+    """Key pane files by the exact socket spelling and pane id supplied."""
+    digest = hashlib.sha256(socket.encode()).hexdigest()[:16]
+    return (state_root() if root is None else root) / f"{digest}-{pane[1:]}"
+
+
 def legacy_paths(raw_socket: str, socket: str, pane: str) -> dict[str, str]:
     """Find files a pre-canonicalisation run of this same pane left behind.
 
@@ -323,8 +335,7 @@ def legacy_paths(raw_socket: str, socket: str, pane: str) -> dict[str, str]:
     found = {"legacy_state_file": "", "legacy_abort_file": ""}
     for root in roots:
         for spelling in sockets:
-            digest = hashlib.sha256(spelling.encode()).hexdigest()[:16]
-            prefix = root / f"{digest}-{pane[1:]}"
+            prefix = pane_file_prefix(spelling, pane, root=root)
             if root == current and spelling == socket:
                 continue  # that is where we live now, not a leftover
             for key, suffix in (("legacy_state_file", ".state.json"),
@@ -612,7 +623,7 @@ def detect_identity() -> dict[str, str]:
         raise BridgeError("could not determine tmux server socket identity")
     raw_socket, socket = socket, canonical_socket(socket)
 
-    prefix = state_root() / f"{hashlib.sha256(socket.encode()).hexdigest()[:16]}-{pane[1:]}"
+    prefix = pane_file_prefix(socket, pane)
     identity_file = prefix.with_suffix(".identity.json")
     identity = {
         "self_pane": pane,
@@ -699,8 +710,7 @@ def outbound_frame_file(socket: str, pane: str) -> Path:
     that was never mangled on the wire. Reading the bytes off disk removes the
     copy from the path entirely.
     """
-    digest = hashlib.sha256(socket.encode()).hexdigest()[:16]
-    return (state_root() / f"{digest}-{pane[1:]}").with_suffix(".outbound.txt")
+    return pane_file_prefix(socket, pane).with_suffix(".outbound.txt")
 
 
 def write_outbound_frame(path: Path, frame: str) -> None:
@@ -801,6 +811,64 @@ def expire_stale(identity: dict[str, str],
     state["status"] = "timed_out"
     save_state(identity, state)
     return state
+
+
+def peer_bridge_status(identity: dict[str, str], target: str,
+                       bridge: str) -> dict[str, Any]:
+    """Read a peer snapshot without expiring or otherwise writing its state.
+
+    Only a pending peer's stored ack deadline is authoritative here; its stale
+    timeout may differ from this process's configuration. Missing shared state
+    leaves acceptance unknown, as it does with different TMPDIR settings.
+    """
+    path = pane_file_prefix(identity["self_socket"], target).with_suffix(".state.json")
+    result: dict[str, Any] = {"pane": target, "state_file": str(path),
+                              "available": False}
+    try:
+        peer = load_state({"state_file": str(path)})
+        if not peer:
+            return {**result, "reason": "peer state is missing"}
+        deadline = (float(peer["ack_deadline"])
+                    if peer.get("status") == "pending" else None)
+        turn = int(peer["turn"])
+        if peer.get("status") not in ("pending", "awaiting_reply", "terminated", "timed_out"):
+            raise ValueError("unknown peer status")
+        if not isinstance(peer.get("bridge"), str):
+            raise ValueError("missing peer bridge")
+    except (BridgeError, OSError, ValueError, TypeError, KeyError):
+        return {**result, "reason": "peer state is unreadable or invalid"}
+    remaining = None if deadline is None else deadline - time.time()
+    return {**result, "available": True, "same_bridge": peer["bridge"] == bridge,
+            "status": peer["status"], "turn": turn, "target": peer.get("target"),
+            "reason": peer.get("reason"), "ack_deadline_epoch": deadline,
+            "ack_seconds_remaining": remaining,
+            "ack_expired": remaining is not None and remaining < 0}
+
+
+def check_peer_reply_window(identity: dict[str, str], target: str,
+                            meta: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a reply known to be unacceptable; a snapshot is not a receipt."""
+    if int(meta["turn"]) == 1:
+        return None
+    peer = peer_bridge_status(identity, target, meta["bridge"])
+    if not peer["available"]:
+        return peer
+    reason = None
+    if not peer["same_bridge"]:
+        reason = "peer has replaced or reset this bridge"
+    elif peer["ack_expired"]:
+        reason = "peer ack timeout exceeded"
+    elif peer["status"] in ("terminated", "timed_out"):
+        reason = f"peer bridge is {peer['status']}"
+    elif (peer["status"] != "pending" or peer["target"] != identity["self_pane"]
+          or peer["turn"] + 1 != int(meta["turn"])):
+        reason = "peer is not expecting this reply turn"
+    if reason:
+        raise PeerBridgeUnavailable(
+            f"{reason} ({target}). Nothing was sent and no turn was used. "
+            "Run status and report the break; continuing requires a fresh bridge, "
+            "not a resend of this frame.")
+    return peer
 
 
 def global_abort_present(identity: dict[str, str]) -> str:
@@ -1754,10 +1822,16 @@ def send_or_release(identity: dict[str, str], target: str,
                           "ack_deadline": time.time() + DEFAULT_ACK_TIMEOUT})
     try:
         return send_message(identity, target, meta, body)
+    except PeerBridgeUnavailable as exc:
+        # End only this pane's record, retaining the last actual turn. The peer
+        # snapshot explains why a fresh bridge is needed; no frame was sent.
+        stopped = dict(previous or {"bridge": meta["bridge"], "turn": 0,
+                                    "target": target})
+        stopped.update(status="terminated", reason=f"peer preflight failed: {exc}")
+        save_state(identity, stopped)
+        raise
     except PeerNotReady:
-        # Nothing left this pane, so put the state back the way it was. A
-        # readiness failure used to terminate the bridge, which forced a reset
-        # and a whole new exchange over a peer that was merely still working.
+        # No frame was sent; preserve the prior turn and deadlines for a retry.
         if previous is None:
             Path(identity["state_file"]).unlink(missing_ok=True)
         else:
@@ -1960,10 +2034,20 @@ def log_inbound(identity: dict[str, str], meta: dict[str, str],
 def send_message(identity: dict[str, str], target: str, meta: dict[str, str], body: str) -> float:
     if target == identity["self_pane"]:
         raise BridgeError("refusing to bridge a pane to itself")
+    check_peer_reply_window(identity, target, meta)
     # identity goes in so a human's abort sentinel ends a long readiness
     # wait, not just the moment after it.
     wait_ready(target, identity=identity)
     check_abort(identity)
+    peer = check_peer_reply_window(identity, target, meta)
+    if peer is not None and not peer["available"]:
+        print(f"agent-bridge: peer deadline could not be checked: {peer['reason']}; "
+              "delivery will not prove acceptance", file=sys.stderr)
+    elif peer is not None and peer["ack_seconds_remaining"] <= ACK_WARN_SECONDS:
+        print(f"agent-bridge: warning: {target} has only "
+              f"{peer['ack_seconds_remaining']:.1f}s left before its ack deadline. "
+              "The peer must run receive before then; delivery can still be rejected "
+              "if validation happens later. The deadline is not extended.", file=sys.stderr)
     msg = render_frame(meta, body)
     # Before delivery, not after: if the paste half-lands and the peer wants to
     # check what was meant to arrive, the file has to already be there.
@@ -1976,6 +2060,7 @@ def send_message(identity: dict[str, str], target: str, meta: dict[str, str], bo
     deadline = time.time() + DEFAULT_ACK_TIMEOUT
     log_identity_basis(identity)
     log_line = (f"target={target} turn={meta['turn']}/{meta['max']} "
+                "delivery=delivered acceptance=unknown "
                 f"first_line={json.dumps(first_line(body), ensure_ascii=False)}")
     with open_log(Path(identity["log_file"])) as handle:
         handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {log_line}\n")
@@ -2073,6 +2158,8 @@ def command_start(args: argparse.Namespace) -> dict[str, Any]:
         "released": released,
         "ack_deadline_epoch": None if reason else deadline,
         "ack_timeout_seconds": DEFAULT_ACK_TIMEOUT,
+        "delivery": "delivered",
+        "acceptance": "unknown",
         **identity_payload(identity),
     }
 
@@ -2264,7 +2351,9 @@ def command_reply(args: argparse.Namespace) -> dict[str, Any]:
     identity = detect_identity()
     check_abort(identity)
 
-    state = load_state(identity)
+    state = expire_stale(identity, load_state(identity))
+    if state and state.get("status") == "timed_out":
+        raise BridgeError(f"{state.get('reason')}; bridge aborted; do not resend")
     if not state or state.get("status") != "awaiting_reply":
         raise BridgeError("there is no validated inbound frame awaiting a reply")
 
@@ -2309,6 +2398,8 @@ def command_reply(args: argparse.Namespace) -> dict[str, Any]:
         "max": maximum,
         "ack_deadline_epoch": None if reason else deadline,
         "ack_timeout_seconds": DEFAULT_ACK_TIMEOUT,
+        "delivery": "delivered",
+        "acceptance": "unknown",
         **identity_payload(identity),
     }
 
@@ -2325,6 +2416,8 @@ def command_status(_: argparse.Namespace) -> dict[str, Any]:
     blocked = bool(stranded) or bool(
         state and state.get("status") not in ("terminated", "timed_out"))
     return {"state": state, "abort_sentinels_present": aborted,
+            "peer": (peer_bridge_status(identity, state["target"], state["bridge"])
+                     if state and state.get("target") and state.get("bridge") else None),
             "start_blocked": blocked,
             "legacy_bridge": stranded,
             "expires_in_seconds": None if expires is None else max(
