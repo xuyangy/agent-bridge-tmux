@@ -32,7 +32,8 @@ tense, with its actual `OUTBOUND` line, or report the concrete failure.
 the frame to the pane; it does **not** establish that the receiving helper
 accepted it or that the agent processed the body. The peer's validated reply
 acknowledges it. If acceptance is unclear, run `status`; do not send a duplicate.
-`delivery=unconfirmed` means `AGENT_BRIDGE_SUBMIT_ATTEMPTS=1` skipped the check.
+`delivery=unconfirmed` means `AGENT_BRIDGE_SUBMIT_ATTEMPTS=1` skipped the check;
+`status` keeps a `delivery_note` for it until the peer replies.
 An `UNCERTAIN` line instead of `OUTBOUND` means the frame was typed into the
 peer but not confirmed sent; see *A frame typed but not confirmed*.
 

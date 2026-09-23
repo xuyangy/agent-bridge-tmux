@@ -1413,16 +1413,17 @@ class TestDeliverRefusesADiscardedPaste(unittest.TestCase):
 
     def test_a_discarded_paste_raises_before_enter(self) -> None:
         setattr(ab, "frame_landed", lambda *_a, **_k: False)
-        with self.assertRaisesRegex(ab.BridgeError, "never appeared in its input box"):
+        with self.assertRaisesRegex(ab.BridgeError, "never appeared in its bottom"):
             ab.deliver("%2", "frame")
         self.assertEqual(self.enters, 0, "Enter must not reach a pane showing a dialog")
 
-    def test_it_is_a_peer_not_ready_so_the_bridge_survives(self) -> None:
-        # Nothing was delivered and no turn was used, so the caller may re-run
-        # the identical command. Only PeerNotReady carries that promise.
+    def test_a_missed_frame_is_uncertain_so_a_late_reply_still_counts(self) -> None:
+        # The text was typed, and the bottom lines can miss a frame sitting in
+        # the input box higher up. Re-running the command could send it twice.
         setattr(ab, "frame_landed", lambda *_a, **_k: False)
-        with self.assertRaises(ab.PeerNotReady):
+        with self.assertRaises(ab.DeliveryUncertain) as caught:
             ab.deliver("%2", "frame")
+        self.assertEqual(caught.exception.delivery, "uncertain")
 
     def test_a_landed_frame_still_gets_its_enter(self) -> None:
         original_submitted = ab.submitted
@@ -1619,6 +1620,21 @@ class TestScreenDelivery(unittest.TestCase):
         self.assertEqual(caught.exception.delivery, "uncertain")
         self.assertEqual(self.enters, 1)
 
+    def test_the_screen_is_read_again_before_a_retry_enter(self) -> None:
+        # Holds the frame after the first Enter, then changes while settling.
+        for during, result in ((ab.INPUT_EMPTY, "delivered"),
+                               (ab.INPUT_UNKNOWN, ab.DeliveryUncertain)):
+            with self.subTest(during=during):
+                self.enters = 0
+                self.reads = [ab.INPUT_EMPTY, ab.INPUT_HOLDS_FRAME,
+                              ab.INPUT_HOLDS_FRAME, during]
+                if result == "delivered":
+                    self.assertEqual(ab.deliver("%2", "frame"), "delivered")
+                else:
+                    with self.assertRaises(result):
+                        ab.deliver("%2", "frame")
+                self.assertEqual(self.enters, 1, "no Enter into a changed screen")
+
     def test_one_attempt_reports_unconfirmed(self) -> None:
         self.reads = [ab.INPUT_EMPTY, ab.INPUT_HOLDS_FRAME, ab.INPUT_HOLDS_FRAME]
         with mock.patch.object(ab, "SUBMIT_ATTEMPTS", 1):
@@ -1667,6 +1683,22 @@ class TestUncertainDeliveryKeepsTheBridge(ExchangeCase):
             reset = ab.command_reset(types.SimpleNamespace(all=False))
         self.assertIn("may still reach the peer", reset["warning"])
         self.assertIn("warning", err.getvalue())
+
+    def test_an_unconfirmed_send_is_remembered_for_status(self) -> None:
+        wire = self.wire
+
+        def send(identity, target, meta, body):
+            deadline, _ = wire(identity, target, meta, body)
+            return deadline, "unconfirmed"
+
+        setattr(ab, "send_message", send)
+        self.assertEqual(self.start("hello", max_turns=4)["delivery"], "unconfirmed")
+        status = ab.command_status(types.SimpleNamespace())
+        self.assertIn("delivery is unconfirmed", status["delivery_note"])
+
+    def test_a_confirmed_send_has_no_note(self) -> None:
+        self.start("hello", max_turns=4)
+        self.assertIsNone(ab.command_status(types.SimpleNamespace())["delivery_note"])
 
     def test_an_uncertain_stop_frame_ends_the_bridge(self) -> None:
         # Nobody replies to a stop frame, so there is nothing to keep open for.

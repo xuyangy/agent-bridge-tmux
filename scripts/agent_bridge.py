@@ -1952,7 +1952,13 @@ def deliver(target: str, msg: str) -> str:
                       f"then pressing Enter again ({attempt}/{SUBMIT_ATTEMPTS - 1})",
                       file=sys.stderr)
                 wait_settled(target)
-                press_enter(target)
+                # The screen can change while it settles: the TUI may submit on
+                # its own, or open a dialog. Look again right before pressing.
+                seen = read_input(target)
+                if seen == INPUT_EMPTY:
+                    return "delivered"
+                if seen == INPUT_HOLDS_FRAME:
+                    press_enter(target)
 
     if seen == INPUT_HOLDS_FRAME:
         raise DeliveryUncertain("unsent", unsent_message(target))
@@ -1990,19 +1996,21 @@ def deliver_by_tail(target: str, msg: str) -> str:
         type_into(target, msg)
         wait_settled(target)
         if not frame_landed(target):
-            # Refuse *before* Enter. Pressing it now would not deliver anything
-            # — the text is already gone — and it is a keystroke into someone
-            # else's pane that answers whatever prompt is sitting there. In the
-            # incident that prompted this check, that Enter dismissed a startup
-            # dialog nobody asked the bridge to touch.
-            raise PeerNotReady(
+            # Stop *before* Enter. The frame is not where the bottom lines show
+            # it, and an Enter now is a keystroke into someone else's pane that
+            # answers whatever prompt is sitting there. In the incident that
+            # prompted this check, that Enter dismissed a startup dialog nobody
+            # asked the bridge to touch. The text was typed, though, and the
+            # bottom lines can miss a frame that is in the input box, so this
+            # is uncertain, not a clean refusal.
+            raise DeliveryUncertain(
+                "uncertain",
                 f"the frame was pasted into {target} but never appeared in its "
-                f"input box, so that pane discarded it. Nothing was delivered "
-                f"and no turn was used. The usual cause is a modal the pane is "
-                f"sitting on — a startup notice, a usage prompt, a permission "
-                f"dialog — which looks idle to the readiness check. Clear that "
-                f"pane by hand until it shows an ordinary empty prompt, then run "
-                f"the same command again."
+                f"bottom {INPUT_TAIL_LINES} lines. Either a modal discarded it — a "
+                f"startup notice, a usage prompt, a permission dialog — or it sits "
+                f"in an input box higher up. This bridge stays pending. Look at that "
+                f"pane: if the frame is in its input box, press Enter there. Do not "
+                f"resend the frame. If it is gone and no reply comes, run reset."
             )
         press_enter(target)
 
@@ -2400,7 +2408,8 @@ def command_start(args: argparse.Namespace) -> dict[str, Any]:
     else:
         save_state(identity, {"status": "pending", "bridge": bridge, "turn": 1,
                               "max": args.max_turns, "target": args.target,
-                              "goal_b64": meta.get("goal_b64"), "ack_deadline": deadline})
+                              "goal_b64": meta.get("goal_b64"), "ack_deadline": deadline,
+                              **unconfirmed_field(delivery)})
     return {
         "action": "stop" if reason else "wait",
         "reason": reason,
@@ -2642,7 +2651,8 @@ def command_reply(args: argparse.Namespace) -> dict[str, Any]:
     else:
         save_state(identity, {"status": "pending", "bridge": state["bridge"], "turn": turn,
                               "max": maximum, "target": target,
-                              "goal_b64": state.get("goal_b64"), "ack_deadline": deadline})
+                              "goal_b64": state.get("goal_b64"), "ack_deadline": deadline,
+                              **unconfirmed_field(delivery)})
     return {
         "action": "stop" if reason else "wait",
         "reason": reason,
@@ -2676,6 +2686,11 @@ def command_status(_: argparse.Namespace) -> dict[str, Any]:
             "expires_in_seconds": None if expires is None else max(
                 0, int(expires - time.time())),
             **identity_payload(identity)}
+
+
+def unconfirmed_field(delivery: str) -> dict[str, str]:
+    """The state field that keeps an unconfirmed send visible to status and reset."""
+    return {} if delivery == "delivered" else {"delivery": delivery}
 
 
 def delivery_note(state: dict[str, Any] | None) -> str | None:

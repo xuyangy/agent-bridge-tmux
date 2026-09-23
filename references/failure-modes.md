@@ -273,8 +273,9 @@ count then misses a frame that is plainly in the input box. Busy wording in
 those lines is about the background agent, so it proves nothing about the frame.
 
 The rest of this section describes `AGENT_BRIDGE_INPUT_MODE=tail`, the
-heuristic for targets other than Claude Code and Codex. There the refusal reads
-`never appeared in its input box, so that pane discarded it`.
+heuristic for targets other than Claude Code and Codex. There the frame is
+typed first and looked for afterwards, and a miss reads `never appeared in its
+bottom N lines`.
 
 What made this silent was the shape of the old submit check. `submitted()`
 reasons from *absence*: no delimiter and no paste placeholder in the input area,
@@ -290,10 +291,12 @@ from a TUI that submits a paste by itself. Without one of those, delivery stops
 nothing and would instead answer whatever dialog is sitting in someone else's
 pane. In the incident that prompted this check, it dismissed a startup dialog.
 
-The refusal is a `PeerNotReady`, so nothing was delivered, no turn was used, and
-the bridge state is put back. Clear the peer pane by hand until it shows an
-ordinary empty prompt, then **run the same command again** — do not `reset` and
-do not start a fresh bridge.
+The frame was typed, and the bottom lines can also miss a frame that sits in
+an input box higher up. So a miss is a `DeliveryUncertain`: the turn is used and
+the bridge stays pending; see *The send is uncertain*. Look at the peer pane. If
+the frame is in its input box, press Enter there. If a modal ate it, clear the
+modal; the frame is gone, so `reset` and open a fresh bridge. **Do not run the
+same command again**, because the peer could get the frame twice.
 
 Worth knowing: a pane id changes when an agent CLI is restarted. If a bridge to
 "window 7" suddenly behaves like this, re-resolve the window to a pane id before
