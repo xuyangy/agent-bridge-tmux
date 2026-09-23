@@ -109,13 +109,20 @@ SETTLE_TIMEOUT = 8.0
 SUBMIT_CONFIRM_BACKOFF = (2.0, 4.0, 6.0, 8.0)
 # Total Enter presses, including the first. Set to 1 to send once and skip the
 # confirmation entirely — right for a target that is not an agent TUI, where an
-# echoed frame looks identical to an unsent one.
+# echoed frame looks identical to an unsent one. The send then reports
+# delivery=unconfirmed, never delivered.
 SUBMIT_ATTEMPTS = int(os.environ.get("AGENT_BRIDGE_SUBMIT_ATTEMPTS", "4"))
-# The input box occupies only the bottom few lines. Looking wider would catch
-# the message again after it scrolled up into the transcript, and read a
-# delivered frame as a stuck one — which is exactly what happened at 8 against a
-# pane with a three-line status bar and a tip line: the submitted frame sat
-# eight non-blank lines up and kept matching. Configurable because the right
+# How delivery reads the target's input box. "screen" (default) locates the
+# input box of a known agent UI (Claude Code, Codex) on the visible screen and
+# reads only that; a screen it does not recognise is refused before anything is
+# typed. "tail" is the heuristic for any other target: the bottom
+# INPUT_TAIL_LINES non-blank lines stand in for the input box.
+INPUT_MODE = os.environ.get("AGENT_BRIDGE_INPUT_MODE", "screen")
+# Tail mode only. The input box occupies only the bottom few lines. Looking
+# wider would catch the message again after it scrolled up into the transcript,
+# and read a delivered frame as a stuck one — which is exactly what happened at
+# 8 against a pane with a three-line status bar and a tip line: the submitted
+# frame sat eight non-blank lines up and kept matching. Configurable because the right
 # number is a property of the target's chrome, not of this protocol.
 INPUT_TAIL_LINES = int(os.environ.get("AGENT_BRIDGE_INPUT_TAIL", "5"))
 # "notify" writes the focus-in escape to the target's pty so a TUI that holds
@@ -1330,7 +1337,7 @@ def sender_cwd_from_meta(meta: dict[str, str]) -> str | None:
 # --- readiness ----------------------------------------------------------------
 
 
-def capture_pane_text(target: str, *, history: bool = False,
+def capture_pane_text(target: str, *, history: bool = False, escapes: bool = False,
                       check: bool = True) -> subprocess.CompletedProcess[str]:
     """Capture a pane as logical lines, not screen rows.
 
@@ -1341,8 +1348,13 @@ def capture_pane_text(target: str, *, history: bool = False,
     sitting in the target's input box: a false success in the one check whose
     entire job is to catch a false success. Reproduced in a 40-column pane, where
     the capture reads "<<<END_AG" / "ENT_MSG>>>" on consecutive rows.
+
+    `escapes` keeps the text attributes (-e), which is how read_input tells a
+    dimmed hint in an empty input box from text somebody typed.
     """
     args = ["capture-pane", "-p", "-J", "-t", target]
+    if escapes:
+        args.append("-e")
     if history:
         args.extend(["-S", "-80"])
     return run_tmux(args, check=check)
@@ -1457,6 +1469,24 @@ class PeerNotReady(BridgeError):
     the very same command later is safe and is the correct move. A generic
     failure cannot promise that, which is why it terminates the bridge instead.
     """
+
+
+class DeliveryUncertain(BridgeError):
+    """The frame was typed into the peer, and whether it was submitted is unknown.
+
+    The opposite promise to PeerNotReady: text did reach the peer's pane, so
+    re-running the command could put a second copy in its queue. The bridge is
+    kept pending instead, because the frame may still arrive — a person pressing
+    Enter in that pane submits it — and the peer's validated reply is then
+    accepted as usual.
+
+    `delivery` is "unsent" when the frame is visibly still in the input box, and
+    "uncertain" when the screen could not show where it went.
+    """
+
+    def __init__(self, delivery: str, message: str) -> None:
+        super().__init__(message)
+        self.delivery = delivery
 
 
 def ready_step(attempt: int) -> float:
@@ -1671,8 +1701,125 @@ def wait_settled(target: str) -> None:
         time.sleep(SETTLE_PAUSE)
 
 
+# What read_input finds in the target's input box.
+INPUT_EMPTY = "empty"
+INPUT_HOLDS_FRAME = "holds_frame"
+INPUT_OTHER_TEXT = "other_text"
+INPUT_UNKNOWN = "unknown"
+
+SGR_RE = re.compile(r"\x1b\[([0-9;:]*)m")
+RULE_RE = re.compile(r"^\s*─{8,}\s*$")
+CLAUDE_PROMPT = "❯"
+CODEX_PROMPT = "›"
+# Codex draws its status line, and at most a warning or two, under the input
+# box. More than this below the prompt row means the row is not the input box.
+CODEX_FOOTER_LINES = 4
+
+
+def split_dim(capture: str) -> tuple[list[str], list[str]]:
+    """Split an escape-bearing capture into two views, line for line.
+
+    The first view is all the text. The second leaves out dim (faint) text,
+    which is how an agent UI draws the hint in an empty input box — Codex's
+    "Ask Codex to do anything", or a rotating example prompt. Attributes carry
+    across lines in a capture, so the state is tracked over the whole capture,
+    not line by line. Colour parameters (38/48/58;5;n and ;2;r;g;b) are skipped
+    whole, so a colour value of 2 is not read as dim.
+    """
+    plain: list[str] = []
+    solid: list[str] = []
+    dim = False
+    pos = 0
+    for match in ANSI_RE.finditer(capture):
+        segment = capture[pos:match.start()]
+        plain.append(segment)
+        solid.append("\n" * segment.count("\n") if dim else segment)
+        pos = match.end()
+        sgr = SGR_RE.fullmatch(match.group(0))
+        if not sgr:
+            continue
+        params = re.split(r"[;:]", sgr.group(1))
+        index = 0
+        while index < len(params):
+            code = params[index] or "0"
+            if code in ("38", "48", "58"):
+                mode = params[index + 1] if index + 1 < len(params) else ""
+                index += 3 if mode == "5" else 5 if mode == "2" else 2
+                continue
+            if code in ("0", "22"):
+                dim = False
+            elif code == "2":
+                dim = True
+            index += 1
+    segment = capture[pos:]
+    plain.append(segment)
+    solid.append("\n" * segment.count("\n") if dim else segment)
+    return "".join(plain).split("\n"), "".join(solid).split("\n")
+
+
+def claude_input(plain: list[str]) -> tuple[int, int] | None:
+    """Rows of Claude Code's input box: a ❯ row directly under a horizontal
+    rule, through the row before the next rule. The last such box on screen is
+    the live one; the transcript echoes past prompts without the rules."""
+    for start in range(len(plain) - 1, 0, -1):
+        if plain[start].lstrip().startswith(CLAUDE_PROMPT) and RULE_RE.match(plain[start - 1]):
+            for end in range(start + 1, len(plain)):
+                if RULE_RE.match(plain[end]):
+                    return start, end
+            return None
+    return None
+
+
+def codex_input(plain: list[str]) -> tuple[int, int] | None:
+    """Rows of Codex's input box: the last row starting with ›, through the row
+    before the next blank one, with only its footer underneath. Codex also marks
+    past prompts in the transcript with ›, which is why only the last one, and
+    only one near the bottom, counts."""
+    for start in range(len(plain) - 1, -1, -1):
+        if not plain[start].startswith(CODEX_PROMPT):
+            continue
+        end = start + 1
+        while end < len(plain) and plain[end].strip():
+            end += 1
+        footer = [line for line in plain[end:] if line.strip()]
+        return (start, end) if len(footer) <= CODEX_FOOTER_LINES else None
+    return None
+
+
+def observe_input(capture: str) -> str:
+    """Classify the input box on a visible-screen capture taken with escapes.
+
+    Only the rows of a recognised input box are read. A frame or paste
+    placeholder anywhere else — the transcript, a status line — is not in the
+    input box and does not count, however close to the bottom it sits. When
+    both UIs seem to match, the box lower on screen wins.
+    """
+    plain, solid = split_dim(capture)
+    found = [box for box in (claude_input(plain), codex_input(plain)) if box]
+    if not found:
+        return INPUT_UNKNOWN
+    start, end = max(found)
+    text = "\n".join(plain[start:end])
+    if FRAME_END in text or PASTE_PLACEHOLDER_RE.search(text):
+        return INPUT_HOLDS_FRAME
+    typed = "\n".join(solid[start:end]).strip()
+    for prompt in (CLAUDE_PROMPT, CODEX_PROMPT):
+        typed = typed.removeprefix(prompt)
+    return INPUT_OTHER_TEXT if typed.strip() else INPUT_EMPTY
+
+
+def read_input(target: str) -> str:
+    """observe_input on the target's visible screen. A capture that fails, for
+    whatever reason, is INPUT_UNKNOWN: a pane that is gone proves nothing about
+    what it did with the frame."""
+    result = capture_pane_text(target, escapes=True, check=False)
+    if result.returncode != 0:
+        return INPUT_UNKNOWN
+    return observe_input(result.stdout)
+
+
 def submitted(target: str) -> bool:
-    """True once the frame is no longer sitting unsent in the target's input box.
+    """Tail mode: True once the frame is no longer sitting unsent in the target's input box.
 
     Anchored on the pane's bottom lines because agent CLIs pin their input box
     there. Two ways to be sure: the pane started working (busy wording), or the
@@ -1701,7 +1848,7 @@ def submitted(target: str) -> bool:
 
 
 def frame_landed(target: str) -> bool:
-    """True once the pasted frame is visibly sitting in the target's input box.
+    """Tail mode: True once the pasted frame is visibly sitting in the target's input box.
 
     The counterpart to submitted(), and the check that was missing. submitted()
     reasons from absence — no delimiter, no placeholder, so it must have been
@@ -1729,13 +1876,16 @@ def frame_landed(target: str) -> bool:
     return FRAME_END in tail or bool(PASTE_PLACEHOLDER_RE.search(tail))
 
 
-def deliver(target: str, msg: str) -> None:
+def deliver(target: str, msg: str) -> str:
     """Put the frame in the target's input box, then make sure it was submitted.
 
-    Two calls, never one. -l sends the string literally, so tokens like "Enter"
-    or "C-c" inside a payload stay text instead of being looked up as key names;
-    -- guards a payload starting with a dash. Enter is a key name, so it cannot
-    ride along inside a literal send.
+    Returns "delivered" once the frame visibly left the input box, or
+    "unconfirmed" when AGENT_BRIDGE_SUBMIT_ATTEMPTS=1 skips that check.
+
+    The payload and Enter are always two calls, never one. -l sends the string
+    literally, so tokens like "Enter" or "C-c" inside a payload stay text
+    instead of being looked up as key names; -- guards a payload starting with a
+    dash. Enter is a key name, so it cannot ride along inside a literal send.
 
     The pause before Enter is not politeness. A long literal string followed
     instantly by C-m arrives as one fast burst, and agent TUIs that detect
@@ -1749,7 +1899,93 @@ def deliver(target: str, msg: str) -> None:
     wild: three presses a second apart all absorbed, then one press after a
     pause submitted immediately. Hence wait for the pane to stop changing before
     the first Enter, and back off between retries rather than pressing harder.
+
+    Every check reads the input box itself (read_input), never the bottom of the
+    screen as a whole. Claude Code draws a background-agent list and status
+    lines under its input box, and busy wording there says nothing about this
+    frame. Three rules follow from that:
+
+    - Nothing is typed unless the input box is visibly empty. A modal, a view
+      this cannot read, or somebody's half-typed text refuses as PeerNotReady,
+      with nothing sent and no turn used.
+    - Enter is pressed only while the frame is visibly in the input box. Once
+      text has been typed, every other outcome is DeliveryUncertain: the frame
+      may have been submitted, discarded, or still be waiting, and the bridge
+      stays pending so a late arrival can still be answered.
+    - Only an input box that is empty again after Enter counts as delivered.
     """
+    if INPUT_MODE == "tail":
+        return deliver_by_tail(target, msg)
+    with Focus(target):
+        before = read_input(target)
+        if before != INPUT_EMPTY:
+            why = ("already holds text" if before in (INPUT_OTHER_TEXT, INPUT_HOLDS_FRAME)
+                   else "is not an input box this can read — a modal, a startup "
+                        "notice, a permission dialog, or a UI other than Claude "
+                        "Code or Codex")
+            raise PeerNotReady(
+                f"the screen of {target} {why}, so nothing was typed. Nothing "
+                f"was sent and no turn was used. Clear that pane by hand until it "
+                f"shows an ordinary empty prompt, then run the same command again. "
+                f"For a target that is not Claude Code or Codex, set "
+                f"AGENT_BRIDGE_INPUT_MODE=tail."
+            )
+        type_into(target, msg)
+        wait_settled(target)
+        seen = read_input(target)
+        if seen != INPUT_HOLDS_FRAME:
+            # Enter is withheld: with the frame not in the input box, it would
+            # answer whatever is on screen instead.
+            raise DeliveryUncertain("uncertain", uncertain_message(target, seen))
+        press_enter(target)
+
+        if SUBMIT_ATTEMPTS <= 1:
+            return "unconfirmed"
+
+        for attempt in range(1, SUBMIT_ATTEMPTS + 1):
+            time.sleep(SUBMIT_CONFIRM_BACKOFF[min(attempt - 1, len(SUBMIT_CONFIRM_BACKOFF) - 1)])
+            seen = read_input(target)
+            if seen == INPUT_EMPTY:
+                return "delivered"
+            if seen == INPUT_HOLDS_FRAME and attempt < SUBMIT_ATTEMPTS:
+                print(f"agent-bridge: {target} still holds the frame unsent; waiting, "
+                      f"then pressing Enter again ({attempt}/{SUBMIT_ATTEMPTS - 1})",
+                      file=sys.stderr)
+                wait_settled(target)
+                press_enter(target)
+
+    if seen == INPUT_HOLDS_FRAME:
+        raise DeliveryUncertain("unsent", unsent_message(target))
+    raise DeliveryUncertain("uncertain", uncertain_message(target, seen))
+
+
+def unsent_message(target: str) -> str:
+    return (
+        f"the frame was typed into {target} but never submitted after "
+        f"{SUBMIT_ATTEMPTS} attempts. It is sitting in that pane's input box, "
+        f"intact. Press Enter there by hand; the peer's reply is then accepted "
+        f"as usual, because this bridge stays pending. Do not resend the frame; "
+        f"the text is already there."
+    )
+
+
+def uncertain_message(target: str, seen: str) -> str:
+    where = {INPUT_EMPTY: "its input box is empty, so the frame was either "
+                          "submitted or discarded",
+             INPUT_OTHER_TEXT: "its input box holds other text",
+             INPUT_UNKNOWN: "its screen no longer shows an input box this can read"}
+    return (
+        f"the frame was typed into {target}, and delivery is uncertain: "
+        f"{where.get(seen, seen)}. This bridge stays pending, so if the frame did "
+        f"arrive the peer's reply is accepted as usual. Look at that pane: if the "
+        f"frame is sitting in its input box, press Enter there. Do not resend the "
+        f"frame. If it is gone and no reply comes, run reset."
+    )
+
+
+def deliver_by_tail(target: str, msg: str) -> str:
+    """deliver() for AGENT_BRIDGE_INPUT_MODE=tail: frame_landed() and
+    submitted() read the bottom INPUT_TAIL_LINES lines as the input box."""
     with Focus(target):
         type_into(target, msg)
         wait_settled(target)
@@ -1771,12 +2007,12 @@ def deliver(target: str, msg: str) -> None:
         press_enter(target)
 
         if SUBMIT_ATTEMPTS <= 1:
-            return
+            return "unconfirmed"
 
         for attempt in range(1, SUBMIT_ATTEMPTS + 1):
             time.sleep(SUBMIT_CONFIRM_BACKOFF[min(attempt - 1, len(SUBMIT_CONFIRM_BACKOFF) - 1)])
             if submitted(target):
-                return
+                return "delivered"
             if attempt < SUBMIT_ATTEMPTS:
                 print(f"agent-bridge: {target} still holds the frame unsent; waiting, "
                       f"then pressing Enter again ({attempt}/{SUBMIT_ATTEMPTS - 1})",
@@ -1784,13 +2020,7 @@ def deliver(target: str, msg: str) -> None:
                 wait_settled(target)
                 press_enter(target)
 
-    raise BridgeError(
-        f"the frame was typed into {target} but never submitted after "
-        f"{SUBMIT_ATTEMPTS} attempts. It is sitting in that pane's input box, "
-        f"intact. Press Enter there by hand — that usually submits it — or raise "
-        f"AGENT_BRIDGE_SUBMIT_DELAY (currently {SUBMIT_DELAY}s) and start a new "
-        f"bridge. Do not resend the frame; the text is already there."
-    )
+    raise DeliveryUncertain("unsent", unsent_message(target))
 
 
 def first_line(body: str) -> str:
@@ -1800,8 +2030,10 @@ def first_line(body: str) -> str:
 
 def send_or_release(identity: dict[str, str], target: str,
                     meta: dict[str, str], body: str,
-                    goal_b64: str | None = None) -> float:
+                    goal_b64: str | None = None) -> tuple[float, str]:
     """Record the attempt, send it, and on failure leave the pane usable.
+
+    Returns the ack deadline and the delivery result from send_message.
 
     The record is written *before* delivery, not after. A frame reaches the peer
     partway through send_message, so a process killed between the peer receiving
@@ -1814,6 +2046,11 @@ def send_or_release(identity: dict[str, str], target: str,
     On failure the record is downgraded to terminated. A delivery that dies
     partway once wrote no state at all, so a stale "pending" survived and every
     later start was refused with "this pane already has an active bridge".
+
+    DeliveryUncertain is the exception: the frame is in the peer's pane and may
+    still be submitted, so the pending record stays, marked with how delivery
+    ended, and the peer's reply to it is accepted as usual. A stop frame gets no
+    reply, so its record is terminated instead.
     """
     previous = load_state(identity)
     save_state(identity, {"status": "pending", "bridge": meta["bridge"],
@@ -1829,6 +2066,19 @@ def send_or_release(identity: dict[str, str], target: str,
                                     "target": target})
         stopped.update(status="terminated", reason=f"peer preflight failed: {exc}")
         save_state(identity, stopped)
+        raise
+    except DeliveryUncertain as exc:
+        record = load_state(identity) or {}
+        if meta.get("stop"):
+            record.update(status="terminated", reason=meta["stop"])
+        record.update(delivery=exc.delivery, delivery_detail=str(exc))
+        save_state(identity, record)
+        log_line = (f"UNCERTAIN target={target} turn={meta['turn']}/{meta['max']} "
+                    f"delivery={exc.delivery} "
+                    f"first_line={json.dumps(first_line(body), ensure_ascii=False)}")
+        with open_log(Path(identity["log_file"])) as handle:
+            handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {log_line}\n")
+        print(log_line)
         raise
     except PeerNotReady:
         # No frame was sent; preserve the prior turn and deadlines for a retry.
@@ -2031,7 +2281,8 @@ def log_inbound(identity: dict[str, str], meta: dict[str, str],
         print(f"agent-bridge: could not log the inbound frame: {exc}", file=sys.stderr)
 
 
-def send_message(identity: dict[str, str], target: str, meta: dict[str, str], body: str) -> float:
+def send_message(identity: dict[str, str], target: str, meta: dict[str, str],
+                 body: str) -> tuple[float, str]:
     if target == identity["self_pane"]:
         raise BridgeError("refusing to bridge a pane to itself")
     check_peer_reply_window(identity, target, meta)
@@ -2055,12 +2306,12 @@ def send_message(identity: dict[str, str], target: str, meta: dict[str, str], bo
         Path(identity.get("outbound_frame_file")
              or outbound_frame_file(identity["self_socket"], identity["self_pane"])), msg)
 
-    deliver(target, msg)
+    delivery = deliver(target, msg)
 
     deadline = time.time() + DEFAULT_ACK_TIMEOUT
     log_identity_basis(identity)
     log_line = (f"target={target} turn={meta['turn']}/{meta['max']} "
-                "delivery=delivered acceptance=unknown "
+                f"delivery={delivery} acceptance=unknown "
                 f"first_line={json.dumps(first_line(body), ensure_ascii=False)}")
     with open_log(Path(identity["log_file"])) as handle:
         handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {log_line}\n")
@@ -2070,7 +2321,7 @@ def send_message(identity: dict[str, str], target: str, meta: dict[str, str], bo
         print(f"agent-bridge: note: {target} is in an UNATTACHED session. Delivery works, "
               f"but no human will see it; the log is the only view: {identity['log_file']}",
               file=sys.stderr)
-    return deadline
+    return deadline, delivery
 
 
 # --- commands -----------------------------------------------------------------
@@ -2141,7 +2392,8 @@ def command_start(args: argparse.Namespace) -> dict[str, Any]:
     if reason:
         meta["stop"] = reason
 
-    deadline = send_or_release(identity, args.target, meta, body, meta.get("goal_b64"))
+    deadline, delivery = send_or_release(identity, args.target, meta, body,
+                                         meta.get("goal_b64"))
     if reason:
         save_state(identity, {"status": "terminated", "reason": reason,
                               "bridge": bridge, "turn": 1})
@@ -2158,7 +2410,7 @@ def command_start(args: argparse.Namespace) -> dict[str, Any]:
         "released": released,
         "ack_deadline_epoch": None if reason else deadline,
         "ack_timeout_seconds": DEFAULT_ACK_TIMEOUT,
-        "delivery": "delivered",
+        "delivery": delivery,
         "acceptance": "unknown",
         **identity_payload(identity),
     }
@@ -2381,8 +2633,8 @@ def command_reply(args: argparse.Namespace) -> dict[str, Any]:
 
     target = str(state["target"])
     goal_b64 = state.get("goal_b64")
-    deadline = send_or_release(identity, target, meta, body,
-                               None if goal_b64 is None else str(goal_b64))
+    deadline, delivery = send_or_release(identity, target, meta, body,
+                                         None if goal_b64 is None else str(goal_b64))
 
     if reason:
         save_state(identity, {"status": "terminated", "reason": reason,
@@ -2398,7 +2650,7 @@ def command_reply(args: argparse.Namespace) -> dict[str, Any]:
         "max": maximum,
         "ack_deadline_epoch": None if reason else deadline,
         "ack_timeout_seconds": DEFAULT_ACK_TIMEOUT,
-        "delivery": "delivered",
+        "delivery": delivery,
         "acceptance": "unknown",
         **identity_payload(identity),
     }
@@ -2416,6 +2668,7 @@ def command_status(_: argparse.Namespace) -> dict[str, Any]:
     blocked = bool(stranded) or bool(
         state and state.get("status") not in ("terminated", "timed_out"))
     return {"state": state, "abort_sentinels_present": aborted,
+            "delivery_note": delivery_note(state),
             "peer": (peer_bridge_status(identity, state["target"], state["bridge"])
                      if state and state.get("target") and state.get("bridge") else None),
             "start_blocked": blocked,
@@ -2423,6 +2676,16 @@ def command_status(_: argparse.Namespace) -> dict[str, Any]:
             "expires_in_seconds": None if expires is None else max(
                 0, int(expires - time.time())),
             **identity_payload(identity)}
+
+
+def delivery_note(state: dict[str, Any] | None) -> str | None:
+    """What to do about a pending frame whose delivery was not confirmed."""
+    if not state or state.get("status") != "pending" or not state.get("delivery"):
+        return None
+    return (f"turn {state.get('turn')} to {state.get('target')} was typed into that "
+            f"pane but delivery is {state['delivery']}. Look at the pane: if the frame "
+            f"is in its input box, press Enter there. Do not resend. A validated reply "
+            f"from the peer settles it; reset gives up on it.")
 
 
 def clear_sentinels(identity: dict[str, str], *, include_global: bool) -> list[str]:
@@ -2499,8 +2762,15 @@ def release_pane(identity: dict[str, str], include_global: bool) -> dict[str, An
                      "bridge": stranded.get("bridge"), "turn": stranded.get("turn"),
                      "updated_at": time.time()})
     removed = clear_sentinels(identity, include_global=include_global)
+    warning = None
+    if delivery_note(previous):
+        warning = (f"released a bridge whose turn {previous.get('turn')} to "
+                   f"{previous.get('target')} had delivery {previous.get('delivery')}. "
+                   f"That frame may still reach the peer, and this pane will now "
+                   f"refuse the peer's reply to it.")
+        print(f"agent-bridge: warning: {warning}", file=sys.stderr)
     return {"released": previous, "released_legacy": stranded,
-            "abort_sentinels_removed": removed}
+            "abort_sentinels_removed": removed, "warning": warning}
 
 
 def build_parser() -> argparse.ArgumentParser:

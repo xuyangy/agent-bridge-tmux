@@ -228,9 +228,11 @@ Two consequences shape the fix, and the second is the counter-intuitive one:
    press after a pause submitted instantly. Retries therefore back off
    (2s, 4s, 6s, 8s) and re-wait for the pane to settle before each press.
 
-Delivery is now confirmed rather than assumed. If it still fails, the error says
-the text is already in that pane — **press Enter there by hand; do not resend**,
-or the peer receives the frame twice.
+Delivery is confirmed, not assumed. If it still fails, the helper prints
+`UNCERTAIN ... delivery=unsent` and says the text is already in that pane —
+**press Enter there by hand; do not resend**, or the peer receives the frame
+twice. The bridge stays `pending`, so the peer's reply to that frame is
+accepted; see *The send is uncertain*.
 
 Tuning:
 
@@ -243,16 +245,36 @@ Set attempts to `1` when the target echoes your text back — a plain `cat`, a
 dumb REPL. There an echoed frame is indistinguishable from an unsent one, so the
 confirmation raises a false alarm. Agent TUIs do not behave that way.
 
-## "never appeared in its input box, so that pane discarded it"
+## "so nothing was typed"
 
 The sibling of the section above, and the nastier half: there the frame is
-stuck somewhere you can see it, here it is simply gone.
+stuck somewhere you can see it; a modal throws it away entirely.
 
 Cause: the peer pane was showing a **modal** — an agent CLI's startup notice, a
 "Press enter to continue", a usage-limit prompt, a permission dialog. Such a
 pane is perfectly stable and prints no busy wording, so `looks_ready` and the
-stability check both call it idle. It then throws the paste away, because its
+stability check both call it idle. A paste into it is thrown away, because its
 input box is not accepting text at all.
+
+In the default `screen` mode, `read_input()` finds the input box on the visible
+screen before anything is typed, and nothing is typed unless it is empty:
+
+- Claude Code: a `❯` row directly under a horizontal rule, through the next rule.
+- Codex: the last row starting with `›`, with only its status line underneath.
+- Dim text is the empty box's hint ("Ask Codex to do anything"), not input.
+
+A modal has no such box, and text somebody typed is not empty, so both refuse
+with `so nothing was typed`. That refusal is a `PeerNotReady`.
+
+Only the input box counts, never the bottom of the screen as a whole. Claude
+Code draws status lines and a background-agent list under its input box, and
+that pushes a paste placeholder well above the bottom few lines. A fixed line
+count then misses a frame that is plainly in the input box. Busy wording in
+those lines is about the background agent, so it proves nothing about the frame.
+
+The rest of this section describes `AGENT_BRIDGE_INPUT_MODE=tail`, the
+heuristic for targets other than Claude Code and Codex. There the refusal reads
+`never appeared in its input box, so that pane discarded it`.
 
 What made this silent was the shape of the old submit check. `submitted()`
 reasons from *absence*: no delimiter and no paste placeholder in the input area,
@@ -276,6 +298,30 @@ do not start a fresh bridge.
 Worth knowing: a pane id changes when an agent CLI is restarted. If a bridge to
 "window 7" suddenly behaves like this, re-resolve the window to a pane id before
 anything else; the agent you were talking to may no longer exist.
+
+## The send is uncertain
+
+`UNCERTAIN target=%N turn=T/M delivery=uncertain` (or `delivery=unsent`) on
+stdout and in the log, and the command exits non-zero. The frame was typed into
+the peer; after that, the input box never showed a clean submit. Typical causes:
+
+- The TUI submitted the paste by itself and was idle again before the check.
+  An empty input box then looks the same as a discarded paste.
+- A dialog opened, or the screen changed into something `read_input()` cannot
+  read.
+- Enter did not submit, as with Claude Code while its background-agent view is
+  open. That is `delivery=unsent`.
+
+Enter is pressed only while the frame is visibly in the input box, so none of
+these gets an Enter into an unknown screen. The turn counts as used, and the
+bridge stays `pending` with `delivery` recorded in the state. A person pressing
+Enter in the peer pane submits the frame, and the peer's reply is accepted. Do
+not re-run the command, because that would type a second copy. `reset` gives up
+on the frame; it warns that the frame may still arrive, and the peer's reply is
+then refused.
+
+A stop frame (`stop=max` or `stop=goal`) gets no reply, so an uncertain one ends
+the bridge instead.
 
 ## "frame failed its integrity check" — or a reply that is subtly wrong
 

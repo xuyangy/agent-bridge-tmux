@@ -298,9 +298,9 @@ class Wire:
     def __init__(self) -> None:
         self.frames: list[str] = []
 
-    def __call__(self, _identity, _target, meta, body) -> float:
+    def __call__(self, _identity, _target, meta, body) -> tuple[float, str]:
         self.frames.append(ab.render_frame(meta, body))
-        return time.time() + ab.DEFAULT_ACK_TIMEOUT
+        return time.time() + ab.DEFAULT_ACK_TIMEOUT, "delivered"
 
     @property
     def last(self) -> str:
@@ -1123,7 +1123,7 @@ class TestPeerReplyWindow(ExchangeCase):
         self.enterContext(mock.patch.object(ab, "state_root", return_value=self.root))
         self.ready = self.enterContext(mock.patch.object(ab, "wait_ready"))
         self.delivery = self.enterContext(mock.patch.object(
-            ab, "deliver", side_effect=lambda target, frame: self.wire.frames.append(frame)))
+            ab, "deliver", side_effect=lambda target, frame: self.wire.frames.append(frame) or "delivered"))
         self.enterContext(mock.patch.object(ab, "tmux_value", return_value="1"))
         self.output = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         self.noise = self.enterContext(contextlib.redirect_stderr(io.StringIO()))
@@ -1388,11 +1388,14 @@ class TestFrameLanded(unittest.TestCase):
 
 
 class TestDeliverRefusesADiscardedPaste(unittest.TestCase):
-    """deliver() must not press Enter into a pane that never took the frame.
-    Enter there delivers nothing and answers whatever dialog is on screen."""
+    """Tail mode: deliver() must not press Enter into a pane that never took the
+    frame. Enter there delivers nothing and answers whatever dialog is on screen."""
 
     def setUp(self) -> None:
         self.enters = 0
+        patcher = mock.patch.object(ab, "INPUT_MODE", "tail")
+        patcher.start()
+        self.addCleanup(patcher.stop)
         original_type, original_settle = ab.type_into, ab.wait_settled
         original_enter, original_landed = ab.press_enter, ab.frame_landed
         original_focus = ab.Focus
@@ -1429,6 +1432,249 @@ class TestDeliverRefusesADiscardedPaste(unittest.TestCase):
         ab.deliver("%2", "frame")
         self.assertGreaterEqual(self.enters, 1)
 
+
+
+# Screens below are trimmed from live captures taken with `capture-pane -p -J -e`
+# (Claude Code v2.1.280, Codex 0.156.1): the same escapes, rows, and order, with
+# paths shortened and rules cut to 40 columns.
+CLAUDE_RULE = "\x1b[38;5;244m" + "─" * 40
+CLAUDE_STATUS = ("\x1b[39m  \x1b[38;5;246m📁 \x1b[38;5;117m~/project\x1b[38;5;246m 🌿 "
+                 "\x1b[38;5;150mmain\x1b[38;5;246m | 🤖 \x1b[38;5;147mOpus 5.5\n"
+                 "  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle) "
+                 "· ← for agents\x1b[39m\n")
+# What Claude Code draws under its input box while a background agent runs.
+CLAUDE_AGENTS = ("\n"
+                 "\x1b[1m  ⏺ main\x1b[0m\n"
+                 "\x1b[38;5;246m  ◯ general-purpose\x1b[39m  \x1b[38;5;246mFixing "
+                 "stage-order markers\x1b[39m    5m 14s · ↓ 316.2k tokens\n")
+
+
+def claude_screen(input_row: str, *, above: str = "assistant output\n\n",
+                  footer: str = CLAUDE_STATUS) -> str:
+    return (f"{above}{CLAUDE_RULE}\n\x1b[39m❯\xa0{input_row}\n{CLAUDE_RULE}\n"
+            f"{footer}")
+
+
+def codex_screen(input_row: str, *, above: str = "• Worked for 1m 6s\n\n") -> str:
+    return (f"{above}\x1b[2m  20:07\n\x1b[0m \n\x1b[48;2;42;70;100m \n"
+            f"\x1b[1m›\x1b[0m\x1b[48;2;42;70;100m {input_row}\n"
+            "\x1b[0m\x1b[48;2;42;70;100m \n"
+            "\x1b[49m  \x1b[38;2;234;212;167mGPT-6-Sol medium\x1b[38;2;99;159;131m · "
+            "\x1b[38;2;170;214;156m~/project\n")
+
+
+CODEX_HINT = "\x1b[2mAsk Codex to do anything"
+
+
+class TestReadInput(unittest.TestCase):
+    """observe_input reads the input box and nothing else. The bug it replaces:
+    a fixed count of bottom lines, which Claude Code's background-agent list
+    pushed the paste placeholder out of, so a frame visibly sitting in the input
+    box was reported as discarded."""
+
+    def test_a_placeholder_above_a_long_footer_is_in_the_input_box(self) -> None:
+        screen = claude_screen("[Pasted text #2]",
+                               above="✻ Waiting for 1 background agent to finish\n\n",
+                               footer=CLAUDE_STATUS + CLAUDE_AGENTS)
+        self.assertEqual(ab.observe_input(screen), ab.INPUT_HOLDS_FRAME)
+
+    def test_an_old_placeholder_in_the_transcript_does_not_count(self) -> None:
+        for old in ("❯ [Pasted text #1]\n", f"{ab.FRAME_START} turn=3 >>> b {ab.FRAME_END}\n"):
+            with self.subTest(old=old):
+                screen = claude_screen("", above=f"{old}assistant output\n\n")
+                self.assertEqual(ab.observe_input(screen), ab.INPUT_EMPTY)
+
+    def test_a_visible_frame_is_in_the_input_box(self) -> None:
+        screen = claude_screen(f"{ab.FRAME_START} turn=1 >>> body {ab.FRAME_END}")
+        self.assertEqual(ab.observe_input(screen), ab.INPUT_HOLDS_FRAME)
+
+    def test_typed_text_is_not_empty(self) -> None:
+        self.assertEqual(ab.observe_input(claude_screen("draft text")), ab.INPUT_OTHER_TEXT)
+
+    def test_busy_wording_under_the_input_box_is_ignored(self) -> None:
+        footer = CLAUDE_STATUS + "✻ Roosting… (44s · esc to interrupt)\n"
+        self.assertEqual(ab.observe_input(claude_screen("[Pasted text #2]", footer=footer)),
+                         ab.INPUT_HOLDS_FRAME)
+        self.assertEqual(ab.observe_input(claude_screen("", footer=footer)), ab.INPUT_EMPTY)
+
+    def test_codex_dim_hint_is_empty(self) -> None:
+        self.assertEqual(ab.observe_input(codex_screen(CODEX_HINT)), ab.INPUT_EMPTY)
+
+    def test_codex_hint_without_attributes_is_not_assumed_empty(self) -> None:
+        # Without -e the hint cannot be told from typed text; refusing is safe.
+        screen = ab.ANSI_RE.sub("", codex_screen(CODEX_HINT))
+        self.assertEqual(ab.observe_input(screen), ab.INPUT_OTHER_TEXT)
+
+    def test_codex_placeholder_and_typed_text(self) -> None:
+        self.assertEqual(ab.observe_input(codex_screen("[Pasted Content 1234 chars]")),
+                         ab.INPUT_HOLDS_FRAME)
+        self.assertEqual(ab.observe_input(codex_screen("draft text")), ab.INPUT_OTHER_TEXT)
+
+    def test_codex_past_prompts_in_the_transcript_do_not_count(self) -> None:
+        above = "› [Pasted Content 900 chars]\n\n• Done.\n\n"
+        self.assertEqual(ab.observe_input(codex_screen(CODEX_HINT, above=above)),
+                         ab.INPUT_EMPTY)
+
+    def test_a_modal_is_never_empty(self) -> None:
+        for screen in ("  1. Yes\n  2. No, quit\n  Press enter to continue\n",
+                       "  Would you like to run the following command?\n\n"
+                       "  $ make test\n\n"
+                       "› 1. Yes, proceed (y)\n"
+                       "  2. No, and tell Codex what to do differently (esc)\n\n"
+                       "  Press enter to confirm or esc to cancel\n"):
+            with self.subTest(screen=screen):
+                self.assertNotEqual(ab.observe_input(screen), ab.INPUT_EMPTY)
+                self.assertNotEqual(ab.observe_input(screen), ab.INPUT_HOLDS_FRAME)
+
+    def test_a_colour_value_of_two_is_not_dim(self) -> None:
+        _plain, solid = ab.split_dim("\x1b[38;2;2;2;2mtyped\x1b[2m hint\x1b[22m more")
+        self.assertEqual(solid, ["typed more"])
+
+    def test_a_failed_capture_is_unknown(self) -> None:
+        with mock.patch.object(ab, "run_tmux", lambda *_a, **_k:
+                               types.SimpleNamespace(returncode=1, stdout="")):
+            self.assertEqual(ab.read_input("%2"), ab.INPUT_UNKNOWN)
+
+    def test_the_capture_is_the_visible_screen_with_attributes(self) -> None:
+        seen: list[list[str]] = []
+
+        def record(args, **_k):
+            seen.append(args)
+            return types.SimpleNamespace(returncode=0, stdout=claude_screen(""))
+
+        with mock.patch.object(ab, "run_tmux", record):
+            ab.read_input("%2")
+        self.assertIn("-e", seen[0])
+        self.assertIn("-J", seen[0])
+        self.assertNotIn("-S", seen[0])
+
+
+class TestScreenDelivery(unittest.TestCase):
+    """deliver() in screen mode, with the input box scripted one read at a time."""
+
+    def setUp(self) -> None:
+        self.typed = 0
+        self.enters = 0
+        self.reads: list[str] = []
+        for name, value in (("type_into", lambda *_a, **_k: self.type()),
+                            ("wait_settled", lambda *_a, **_k: None),
+                            ("press_enter", lambda *_a, **_k: self.enter()),
+                            ("read_input", lambda *_a, **_k: self.next_read()),
+                            ("Focus", lambda *_a, **_k: contextlib.nullcontext()),
+                            ("INPUT_MODE", "screen"),
+                            ("SUBMIT_ATTEMPTS", 4)):
+            patcher = mock.patch.object(ab, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(ab.time, "sleep", lambda *_a: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def type(self) -> None:
+        self.typed += 1
+
+    def enter(self) -> None:
+        self.enters += 1
+
+    def next_read(self) -> str:
+        return self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
+
+    def test_text_already_in_the_input_box_refuses_without_typing(self) -> None:
+        for before in (ab.INPUT_OTHER_TEXT, ab.INPUT_HOLDS_FRAME, ab.INPUT_UNKNOWN):
+            with self.subTest(before=before):
+                self.reads = [before]
+                with self.assertRaises(ab.PeerNotReady):
+                    ab.deliver("%2", "frame")
+                self.assertEqual((self.typed, self.enters), (0, 0))
+
+    def test_a_landed_frame_that_submits_is_delivered(self) -> None:
+        self.reads = [ab.INPUT_EMPTY, ab.INPUT_HOLDS_FRAME, ab.INPUT_EMPTY]
+        self.assertEqual(ab.deliver("%2", "frame"), "delivered")
+        self.assertEqual(self.enters, 1)
+
+    def test_an_empty_box_after_paste_is_uncertain_and_gets_no_enter(self) -> None:
+        # A TUI that submits a paste on its own and is idle again by the time we
+        # look shows exactly what a discarded paste shows.
+        for after in (ab.INPUT_EMPTY, ab.INPUT_UNKNOWN, ab.INPUT_OTHER_TEXT):
+            with self.subTest(after=after):
+                self.enters = 0
+                self.reads = [ab.INPUT_EMPTY, after]
+                with self.assertRaises(ab.DeliveryUncertain) as caught:
+                    ab.deliver("%2", "frame")
+                self.assertEqual(caught.exception.delivery, "uncertain")
+                self.assertEqual(self.enters, 0)
+
+    def test_a_frame_that_never_submits_is_unsent(self) -> None:
+        self.reads = [ab.INPUT_EMPTY, ab.INPUT_HOLDS_FRAME]
+        with self.assertRaises(ab.DeliveryUncertain) as caught:
+            ab.deliver("%2", "frame")
+        self.assertEqual(caught.exception.delivery, "unsent")
+        self.assertEqual(self.enters, 4)
+        self.assertIn("Press Enter there", str(caught.exception))
+
+    def test_an_unreadable_screen_after_enter_is_uncertain_without_more_enters(self) -> None:
+        self.reads = [ab.INPUT_EMPTY, ab.INPUT_HOLDS_FRAME, ab.INPUT_UNKNOWN]
+        with self.assertRaises(ab.DeliveryUncertain) as caught:
+            ab.deliver("%2", "frame")
+        self.assertEqual(caught.exception.delivery, "uncertain")
+        self.assertEqual(self.enters, 1)
+
+    def test_one_attempt_reports_unconfirmed(self) -> None:
+        self.reads = [ab.INPUT_EMPTY, ab.INPUT_HOLDS_FRAME, ab.INPUT_HOLDS_FRAME]
+        with mock.patch.object(ab, "SUBMIT_ATTEMPTS", 1):
+            self.assertEqual(ab.deliver("%2", "frame"), "unconfirmed")
+
+
+class TestUncertainDeliveryKeepsTheBridge(ExchangeCase):
+    """A frame typed into the peer may still be submitted — by a person pressing
+    Enter there — so the sender's bridge must still accept the peer's reply."""
+
+    def uncertain_wire(self, delivery: str = "unsent"):
+        wire = self.wire
+
+        def send(identity, target, meta, body):
+            wire(identity, target, meta, body)
+            raise ab.DeliveryUncertain(delivery, "frame typed; delivery unknown")
+
+        setattr(ab, "send_message", send)
+
+    def test_a_manually_submitted_frame_still_gets_its_reply_accepted(self) -> None:
+        self.uncertain_wire()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(ab.DeliveryUncertain):
+            self.start("hello", max_turns=4)
+        state = ab.load_state(self.a)
+        self.assertEqual((state["status"], state["delivery"]), ("pending", "unsent"))
+        self.assertIn("UNCERTAIN target=%2 turn=1/4 delivery=unsent",
+                      Path(self.a["log_file"]).read_text())
+
+        setattr(ab, "send_message", self.wire)
+        self.as_agent(self.b)
+        self.receive(self.wire.last, "b")
+        self.reply("answer", "b")
+        self.as_agent(self.a)
+        self.assertEqual(self.receive(self.wire.last, "a")["action"], "process")
+
+    def test_status_and_reset_explain_the_pending_frame(self) -> None:
+        self.uncertain_wire("uncertain")
+        with contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(ab.DeliveryUncertain):
+            self.start("hello", max_turns=4)
+        status = ab.command_status(types.SimpleNamespace())
+        self.assertTrue(status["start_blocked"])
+        self.assertIn("delivery is uncertain", status["delivery_note"])
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            reset = ab.command_reset(types.SimpleNamespace(all=False))
+        self.assertIn("may still reach the peer", reset["warning"])
+        self.assertIn("warning", err.getvalue())
+
+    def test_an_uncertain_stop_frame_ends_the_bridge(self) -> None:
+        # Nobody replies to a stop frame, so there is nothing to keep open for.
+        self.uncertain_wire()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(ab.DeliveryUncertain):
+            self.start("hello", max_turns=1)
+        self.assertEqual(ab.load_state(self.a)["status"], "terminated")
 
 
 class TestSubmitted(unittest.TestCase):
@@ -2617,7 +2863,7 @@ class TestOutboundFrameFile(TempRoot):
     def send(self, identity: dict[str, str], body: str, read: bool = True) -> str:
         for name, fake in (("wait_ready", lambda target, **kw: None),
                            ("check_abort", lambda ident: None),
-                           ("deliver", lambda target, msg: None),
+                           ("deliver", lambda target, msg: "delivered"),
                            ("tmux_value", lambda fmt, target=None: "1")):
             original = getattr(ab, name)
             setattr(ab, name, fake)
@@ -2688,7 +2934,7 @@ class TestSpillAndFromPaneTogether(TempRoot):
         sender = make_identity(self.root, "%9")
         for name, fake in (("wait_ready", lambda target, **kw: None),
                            ("check_abort", lambda ident: None),
-                           ("deliver", lambda target, msg: None),
+                           ("deliver", lambda target, msg: "delivered"),
                            ("tmux_value", lambda fmt, target=None: "1")):
             original = getattr(ab, name)
             setattr(ab, name, fake)
@@ -2780,7 +3026,7 @@ class TestSendMessageRecordsTheBasis(TempRoot):
     def send(self, identity: dict[str, str]) -> None:
         for name, fake in (("wait_ready", lambda target, **kw: None),
                            ("check_abort", lambda ident: None),
-                           ("deliver", lambda target, msg: None),
+                           ("deliver", lambda target, msg: "delivered"),
                            ("tmux_value", lambda fmt, target=None: "1")):
             original = getattr(ab, name)
             setattr(ab, name, fake)

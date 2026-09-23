@@ -138,7 +138,8 @@ the reasons below end a bridge without that agreement.
 - the turn limit is reached — hard; no frame goes out past it
 - the goal phrase appears
 - the target pane never goes idle
-- the frame could not be submitted into the peer's input box
+- the frame was typed into the peer's pane but not confirmed sent, and never
+  gets a reply
 - a frame arrives corrupted (its integrity checksum does not match)
 - no reply within the ack timeout (default 10800s, set `AGENT_BRIDGE_ACK_TIMEOUT`)
 - an unfinished bridge goes stale (default 10800s, set `AGENT_BRIDGE_STALE_TIMEOUT`)
@@ -157,12 +158,14 @@ not decide that on its own, and it never continues without you saying so.
 Agent TUIs treat fast input as a paste, and a newline inside a paste is a line
 break, not a submit. So a frame can arrive fully typed and never be sent.
 
-The helper waits for the pane to settle, presses Enter, checks that it went, and
-backs off before trying again. If it still cannot submit, it says so and stops —
-it will not pretend the message was delivered.
+The helper types only into an input box it can see is empty. It then waits
+for the pane to settle, presses Enter, checks that it went, and backs off before
+trying again. If it cannot confirm the send, it prints an `UNCERTAIN` line and
+stops. It will not pretend the message was delivered. The bridge stays open, so
+the peer's reply still counts if the message gets through.
 
-When that happens: **press Enter in that pane yourself.** The text is already
-there. Do not resend, or the peer gets it twice.
+When that happens: **look at that pane, and press Enter there if the message is
+in its input box.** Do not resend, or the peer gets it twice.
 
 Knobs, if your setup needs them:
 
@@ -170,7 +173,8 @@ Knobs, if your setup needs them:
 | --- | --- | --- |
 | `AGENT_BRIDGE_SUBMIT_DELAY` | `0.8` | wait before the first Enter; raise for a slow TUI |
 | `AGENT_BRIDGE_SUBMIT_ATTEMPTS` | `4` | total Enter presses; `1` disables the check |
-| `AGENT_BRIDGE_INPUT_TAIL` | `5` | how many bottom lines count as the input box; raise if the target has a thick status bar |
+| `AGENT_BRIDGE_INPUT_MODE` | `screen` | `screen` reads the input box of Claude Code or Codex and refuses any other screen; `tail` treats the bottom lines as the input box, for other targets |
+| `AGENT_BRIDGE_INPUT_TAIL` | `5` | `tail` mode only: how many bottom lines count as the input box |
 | `AGENT_BRIDGE_READY_TIMEOUT` | `900` | seconds to wait for a busy peer to go idle before giving up |
 | `AGENT_BRIDGE_FOCUS` | `notify` | tells the target pane it has focus, so a TUI that holds unfocused keystrokes accepts them; nothing moves on screen. `off` skips it |
 

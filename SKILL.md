@@ -32,6 +32,9 @@ tense, with its actual `OUTBOUND` line, or report the concrete failure.
 the frame to the pane; it does **not** establish that the receiving helper
 accepted it or that the agent processed the body. The peer's validated reply
 acknowledges it. If acceptance is unclear, run `status`; do not send a duplicate.
+`delivery=unconfirmed` means `AGENT_BRIDGE_SUBMIT_ATTEMPTS=1` skipped the check.
+An `UNCERTAIN` line instead of `OUTBOUND` means the frame was typed into the
+peer but not confirmed sent; see *A frame typed but not confirmed*.
 
 ## Precondition: one tmux server
 
@@ -488,19 +491,47 @@ before delivery, and the helper puts the bridge state back exactly as it was, so
 - Only after re-running has failed too — the peer is stuck, gone, or in a pager —
   is this a break, and then the section below applies.
 
-A second refusal reads `never appeared in its input box, so that pane discarded
-it`. The peer was sitting on a modal — a startup notice, a usage prompt, a
-permission dialog — which is stable and silent, so it passes every readiness
-check and then throws the paste away. Nothing was delivered and no turn was
-used, and the helper deliberately does not press Enter into that dialog. Ask the
-human to clear the pane until it shows an ordinary empty prompt, then run the
-same command again. Do not `reset` and do not open a new bridge. If the peer was
-restarted, its pane id has changed — re-resolve the window before you retry.
+A second refusal reads `so nothing was typed`. The helper types only into an
+input box it can see is empty. The peer was showing something else: a modal —
+a startup notice, a usage prompt, a permission dialog — or text somebody had
+typed. Such a pane is stable and silent, so it passes the readiness check.
+Nothing was delivered and no turn was used. Ask the human to clear the pane
+until it shows an ordinary empty prompt, then run the same command again. Do not
+`reset` and do not open a new bridge. If the peer was restarted, its pane id has
+changed — re-resolve the window before you retry.
+
+The helper reads the input boxes of Claude Code and Codex. For any other target,
+set `AGENT_BRIDGE_INPUT_MODE=tail`: the bottom lines of the pane then stand in
+for the input box.
 
 Raise the budget with `AGENT_BRIDGE_READY_TIMEOUT=<seconds>` when the peer is
 known to be on a long job. The budget is wall-clock and covers the checks
 themselves, and the human's `abort_command` is read every couple of seconds
 during the wait, so it stops a long wait immediately.
+
+## A frame typed but not confirmed
+
+The command fails with an `UNCERTAIN ... delivery=unsent` or
+`delivery=uncertain` line. The frame reached the peer's pane, but the helper
+could not see it get submitted:
+
+- `unsent`: the frame is still in the peer's input box after every Enter.
+- `uncertain`: after the paste or after Enter, the input box showed neither the
+  frame nor a clean submit. The frame may have been submitted, discarded, or
+  still be waiting.
+
+The turn **was** used, and the bridge stays `pending`. So:
+
+- Do **not** run the same command again. The peer could receive the frame twice.
+- Ask the human to look at the peer pane. If the frame is in its input box, they
+  press Enter there.
+- The peer's reply then arrives and `receive` accepts it as usual. That reply
+  settles the send.
+- If the frame is gone and no reply comes, this is a break; see *Ending is the
+  user's call*. `reset` gives up on the frame, and warns that the peer may still
+  receive it and that its reply will then be refused.
+
+`status` shows the same guidance in `delivery_note` while the send is unsettled.
 
 ## Ending is the user's call, not yours
 
